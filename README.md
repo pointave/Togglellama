@@ -1,0 +1,1 @@
+A toggle button I added to my taskbar to easily exit and restart ollama, just saves a few clicks. The other script I connect to a keybind alt+space to pull up a list of all ollama models and easily select a model with its position in the list, arranged by date newest to oldest.
