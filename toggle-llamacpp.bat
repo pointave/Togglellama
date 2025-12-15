@@ -14,7 +14,7 @@ if "%ERRORLEVEL%"=="0" (
 ) else (
     echo llama-server is not running. Starting it...
     pushd "%LLAMA_DIR%"
-    start "llama.cpp server" "%LLAMA_EXE%" --models-dir "%MODELS_DIR%" -c 0
+    start "llama.cpp server" "%LLAMA_EXE%" --models-dir "%MODELS_DIR%" -c 16000     ##### add flags here
     popd
 )
 
