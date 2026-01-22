@@ -6,6 +6,9 @@ Double click on icon to start server, double click then converts to an unload mo
 
 After the server has been started, new bat files are created if you like the old method of starting and unloading models.
 
+***Configuration menu is weird, usually cancel and save works but if it is unresponsive move the window to restore its focus.***
+
+----
 CREDIT
 
 llama.cpp (using their icon)
