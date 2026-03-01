@@ -6,7 +6,8 @@ import threading
 from pathlib import Path
 import json
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import messagebox, filedialog
+import customtkinter as ctk
 import requests
 import webbrowser
 import sys
@@ -14,654 +15,694 @@ import os
 import psutil
 import signal
 
+# ── Global CustomTkinter defaults ───────────────────────────────────────────
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("dark-blue")
+
+
+def _make_window_foreground(win: ctk.CTk | ctk.CTkToplevel):
+    """Force a window to the foreground and grab input focus reliably on Windows."""
+    win.lift()
+    win.attributes("-topmost", True)
+    win.focus_force()
+    win.after(150, lambda: win.attributes("-topmost", False))
+
+
+# ── Reusable styled widgets ──────────────────────────────────────────────────
+
+ACCENT   = "#4f8ef7"
+ACCENT2  = "#2d6fd4"
+BG_DARK  = "#1a1a2e"
+BG_MID   = "#16213e"
+BG_CARD  = "#0f3460"
+TEXT     = "#e0e0e0"
+TEXT_DIM = "#8a8aaa"
+SUCCESS  = "#43c59e"
+DANGER   = "#e05c5c"
+
+FONT_TITLE  = ("Segoe UI", 18, "bold")
+FONT_HEADER = ("Segoe UI", 12, "bold")
+FONT_BODY   = ("Segoe UI", 11)
+FONT_SMALL  = ("Segoe UI", 9)
+
+
+def _section_label(parent, text):
+    frm = ctk.CTkFrame(parent, fg_color="transparent")
+    frm.pack(fill="x", padx=20, pady=(14, 2))
+    ctk.CTkLabel(frm, text=text, font=FONT_HEADER,
+                 text_color=ACCENT).pack(anchor="w")
+    ctk.CTkFrame(frm, height=1, fg_color=ACCENT2).pack(fill="x", pady=(3, 0))
+
+
+def _row(parent, label_text, widget_factory, pady=4, height=36):
+    frm = ctk.CTkFrame(parent, fg_color="transparent")
+    frm.pack(fill="x", padx=24, pady=pady)
+    ctk.CTkLabel(frm, text=label_text, font=FONT_BODY,
+                 text_color=TEXT, width=180, anchor="w").pack(side="left")
+    widget = widget_factory(frm, height=height)
+    widget.pack(side="left", fill="x", expand=True)
+    return widget
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 class LlamaCppTray:
     def __init__(self):
-        self.bat_file = Path(__file__).parent / "Llamacpp.bat"
-        self.config_file = Path(__file__).parent / "llamacpp_config.json"
-        self.server_running = False
-        self.embedding_server_running = False
-        self.monitor_thread = None
-        self.last_click_time = 0
-        self.double_click_threshold = 0.5  # 500ms for double click detection
-        self.click_count = 0
-        self.click_timer = None
-        self.running = False
-        self.embedding_server_check_counter = 0  # Add counter for less frequent health checks
+        self.bat_file                       = Path(__file__).parent / "Llamacpp.bat"
+        self.config_file                    = Path(__file__).parent / "llamacpp_config.json"
+        self.server_running                 = False
+        self.embedding_server_running       = False
+        self.monitor_thread                 = None
+        self.last_click_time                = 0
+        self.double_click_threshold         = 0.5
+        self.click_count                    = 0
+        self.click_timer                    = None
+        self.running                        = False
+        self.embedding_server_check_counter = 0
         self.load_config()
-        
+
+    # ── signal / lifecycle ──────────────────────────────────────────────────
     def signal_handler(self, signum, frame):
-        """Handle Ctrl+C signal gracefully"""
         print("\nReceived interrupt signal. Shutting down...")
         self.running = False
-        
-        # Stop any running servers
         if self.server_running:
             try:
-                subprocess.run(['taskkill', '/IM', 'llama-server.exe', '/T', '/F'], 
-                             shell=True, check=True)
-            except:
+                subprocess.run(['taskkill', '/IM', 'llama-server.exe', '/T', '/F'],
+                               shell=True, check=True)
+            except Exception:
                 pass
-        
-        # Stop the tray icon
         if hasattr(self, 'icon') and self.icon:
             self.icon.stop()
-        
-        # Exit the application
         sys.exit(0)
-        
+
+    # ── config ──────────────────────────────────────────────────────────────
     def load_config(self):
-        """Load configuration from file"""
+        defaults = {
+            "context_window": 32000,
+            "port": 8080,
+            "models_dir": "",
+            "llamacpp_dir": "",
+            "use_fit": False,
+            "no_mmproj": False,
+            "ctk_q8": False,
+            "ctv_q8": False,
+            "thinking": "off",
+            "max_models": 1,
+            "flags": [],
+            "theme": "dark",
+            "embedding_model": "",
+            "embedding_port": 8082,
+            "embedding_flags": [],
+            "flash_attn": False,
+        }
         try:
             if self.config_file.exists():
                 with open(self.config_file, 'r') as f:
-                    self.config = json.load(f)
+                    loaded = json.load(f)
+                self.config = {**defaults, **loaded}
             else:
-                self.config = {
-                    "context_window": 32000,
-                    "port": 8080,
-                    "models_dir": "",
-                    "llamacpp_dir": "",
-                    "use_fit": False,
-                    "max_models": 1,
-                    "flags": [],
-                    "theme": "light",
-                    "embedding_model": "",
-                    "embedding_port": 8082
-                }
-        except:
-            self.config = {
-                "context_window": 32000,
-                "port": 8080,
-                "models_dir": "",
-                "llamacpp_dir": "",
-                "use_fit": False,
-                "max_models": 1,
-                "flags": [],
-                "theme": "light",
-                "embedding_model": "",
-                "embedding_port": 8082
-            }
-        
+                self.config = defaults
+        except Exception:
+            self.config = defaults
+
     def save_config(self):
-        """Save configuration to file"""
         try:
             with open(self.config_file, 'w') as f:
                 json.dump(self.config, f, indent=2)
             return True
-        except:
+        except Exception:
             return False
-        
+
+    # ── server checks ───────────────────────────────────────────────────────
     def check_server_status(self):
-        """Check if llama-server.exe is running"""
         try:
-            result = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq llama-server.exe'], 
-                                  capture_output=True, text=True, shell=True)
+            result = subprocess.run(
+                ['tasklist', '/FI', 'IMAGENAME eq llama-server.exe'],
+                capture_output=True, text=True, shell=True)
             return 'llama-server.exe' in result.stdout
-        except:
+        except Exception:
             return False
-    
+
     def check_embedding_server_status(self):
-        """Check if embedding server is running - simplified without health checks"""
-        # Just check if the process is running via tasklist
         try:
-            result = subprocess.run(['tasklist', '/FI', f'IMAGENAME eq llama-server.exe', '/V'], 
-                                  capture_output=True, text=True, shell=True)
-            # print(f"DEBUG: check_embedding_server_status tasklist result:\n{result.stdout}")
-            
-            # Look for process running on the embedding port
+            result = subprocess.run(
+                ['tasklist', '/FI', 'IMAGENAME eq llama-server.exe', '/V'],
+                capture_output=True, text=True, shell=True)
             for line in result.stdout.split('\n'):
-                # print(f"DEBUG: Checking line: '{line.strip()}'")
-                if f":{self.config['embedding_port']}" in line or 'embedding' in line.lower():
-                    # print(f"DEBUG: Found embedding server line: '{line.strip()}'")
+                if (f":{self.config['embedding_port']}" in line
+                        or 'embedding' in line.lower()):
                     return True
             return False
-        except Exception as e:
-            # print(f"DEBUG: Exception in check_embedding_server_status: {e}")
+        except Exception:
             return False
-    
+
     def update_status(self):
-        """Update server status and icon"""
-        was_running = self.server_running
+        was_running           = self.server_running
         was_embedding_running = self.embedding_server_running
-        
-        # print(f"DEBUG: Before status check - Server: {self.server_running}, Embedding: {self.embedding_server_running}")
-        
-        self.server_running = self.check_server_status()
+        self.server_running           = self.check_server_status()
         self.embedding_server_running = self.check_embedding_server_status()
-        
-        # print(f"DEBUG: After status check - Server: {self.server_running}, Embedding: {self.embedding_server_running}")
-        
         if was_running != self.server_running or was_embedding_running != self.embedding_server_running:
-            # print("DEBUG: Status changed, updating icon")
             self.update_icon()
-    
+
     def update_icon(self):
-        """Update tray icon based on server status"""
         if self.server_running:
-            self.icon.icon = self.load_icon(color='green')
+            self.icon.icon  = self.load_icon(color='green')
             self.icon.title = "Llama.cpp - Running"
         else:
-            self.icon.icon = self.load_icon(color='red')
+            self.icon.icon  = self.load_icon(color='red')
             self.icon.title = "Llama.cpp - Stopped"
-    
+
+    # ── icon helpers ────────────────────────────────────────────────────────
     def create_image(self, color='red'):
-        """Create a simple colored square as an icon"""
-        width = 64
-        height = 64
-        image = Image.new('RGB', (width, height), color=color)
+        image = Image.new('RGB', (64, 64), color=color)
         dc = ImageDraw.Draw(image)
-        dc.rectangle([width // 4, height // 4, width * 3 // 4, height * 3 // 4], fill='white')
+        dc.rectangle([16, 16, 48, 48], fill='white')
         return image
-    
+
     def load_icon(self, color='red'):
-        """Try to load an .ico file, fallback to generated image if not found"""
         icon_path = Path(__file__).parent / "llamacpp_tray.ico"
         if icon_path.exists() and icon_path.stat().st_size > 0:
             try:
-                base_icon = Image.open(icon_path).convert('RGBA')
+                base = Image.open(icon_path).convert('RGBA')
                 if color == 'red':
-                    overlay = Image.new('RGBA', base_icon.size, (255, 0, 0, 50))
-                    return Image.alpha_composite(base_icon, overlay)
-                return base_icon
-            except:
+                    overlay = Image.new('RGBA', base.size, (255, 0, 0, 50))
+                    return Image.alpha_composite(base, overlay)
+                return base
+            except Exception:
                 pass
         return self.create_image(color)
-    
+
+    # ── setup check ─────────────────────────────────────────────────────────
     def check_setup_required(self):
-        """Check if setup is required (first run or missing config)"""
-        required_fields = ['models_dir', 'llamacpp_dir']
-        for field in required_fields:
+        for field in ('models_dir', 'llamacpp_dir'):
             if not self.config.get(field, '').strip():
                 return True
         return False
-    
+
+    # ════════════════════════════════════════════════════════════════════════
+    #  SETUP WIZARD
+    # ════════════════════════════════════════════════════════════════════════
     def show_setup_wizard(self):
-        """Show first-time setup wizard"""
-        try:
-            root = tk.Tk()
-            root.title("Llama.cpp Tray - First Time Setup")
-            root.geometry("500x700")
-            root.resizable(False, False)
-            
-            # Center the window
-            root.update_idletasks()
-            width = root.winfo_width()
-            height = root.winfo_height()
-            screen_width = root.winfo_screenwidth()
-            screen_height = root.winfo_screenheight()
-            x = (screen_width - width) // 2
-            y = (screen_height - height) // 2
-            root.geometry(f"{width}x{height}+{x}+{y}")
-            
-            # Main frame with padding
-            main_frame = tk.Frame(root, padx=20, pady=20)
-            main_frame.pack(fill=tk.BOTH, expand=True)
-            
-            # Title
-            title_label = tk.Label(main_frame, text="Welcome to Llama.cpp Tray!", 
-                                 font=("Arial", 16, "bold"))
-            title_label.pack(pady=(0, 20))
-            
-            # Instructions
-            instructions = tk.Text(main_frame, height=12, wrap=tk.WORD, font=("Arial", 10))
-            instructions.pack(fill=tk.X, pady=(0, 20))
-            instructions.insert(tk.END, 
-                "This is your first time running Llama.cpp Tray. Before you can use it, "
-                "we need to configure a few essential paths:\n\n"
-                "1. Llama.cpp Directory: The path to your llama.cpp build folder containing llama-server.exe\n"
-                "   (e.g., C:\\llama.cpp\\build\\bin\\Release)\n\n"
-                "2. Models Directory: Where your GGUF model files are stored\n"
-                "   (e.g., C:\\Models\\GGUF)\n\n"
-                "3. Embedding Model (optional): Select a specific embedding model file for embeddings\n"
-                "   This is optional - you can configure it later if needed\n\n"
-                "4. Server Port: Port for the main llama.cpp server\n"
-                "   (default: 8080)\n\n"
-                "You can change these settings later from the Configuration menu.")
-            instructions.config(state=tk.DISABLED)
-            
-            # Input fields
-            widgets = {}
-            
-            # Llama.cpp directory
-            llamacpp_label = tk.Label(main_frame, text="Llama.cpp Directory (with llama-server.exe):", 
-                                    font=("Arial", 10, "bold"))
-            llamacpp_label.pack(anchor=tk.W, pady=(10, 5))
-            widgets["label"] = [llamacpp_label]
-            
-            llamacpp_frame = tk.Frame(main_frame)
-            llamacpp_frame.pack(fill=tk.X, pady=(0, 10))
-            
-            llamacpp_var = tk.StringVar(value=self.config.get("llamacpp_dir", ""))
-            llamacpp_entry = tk.Entry(llamacpp_frame, textvariable=llamacpp_var, width=60)
-            llamacpp_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            widgets["entry"] = [llamacpp_entry]
-            
-            def browse_llamacpp():
-                from tkinter import filedialog
-                directory = filedialog.askdirectory(title="Select Llama.cpp Directory")
-                if directory:
-                    llamacpp_var.set(directory)
-            
-            browse_llamacpp_btn = tk.Button(llamacpp_frame, text="Browse...", command=browse_llamacpp)
-            browse_llamacpp_btn.pack(side=tk.RIGHT, padx=(5, 0))
-            widgets["button"] = [browse_llamacpp_btn]
-            
-            # Models directory
-            models_label = tk.Label(main_frame, text="Models Directory (with .gguf files):", 
-                                  font=("Arial", 10, "bold"))
-            models_label.pack(anchor=tk.W, pady=(10, 5))
-            widgets["label"].append(models_label)
-            
-            models_frame = tk.Frame(main_frame)
-            models_frame.pack(fill=tk.X, pady=(0, 10))
-            
-            models_var = tk.StringVar(value=self.config.get("models_dir", ""))
-            models_entry = tk.Entry(models_frame, textvariable=models_var, width=60)
-            models_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            widgets["entry"].append(models_entry)
-            
-            def browse_models():
-                from tkinter import filedialog
-                directory = filedialog.askdirectory(title="Select Models Directory")
-                if directory:
-                    models_var.set(directory)
-            
-            browse_models_btn = tk.Button(models_frame, text="Browse...", command=browse_models)
-            browse_models_btn.pack(side=tk.RIGHT, padx=(5, 0))
-            widgets["button"].append(browse_models_btn)
-            
-            # Embedding models directory (optional)
-            embedding_label = tk.Label(main_frame, text="Embedding Model (optional):", 
-                                  font=("Arial", 10, "bold"))
-            embedding_label.pack(anchor=tk.W, pady=(10, 5))
-            widgets["label"].append(embedding_label)
-            
-            embedding_frame = tk.Frame(main_frame)
-            embedding_frame.pack(fill=tk.X, pady=(0, 10))
-            
-            embedding_var = tk.StringVar(value=self.config.get("embedding_model", ""))
-            embedding_entry = tk.Entry(embedding_frame, textvariable=embedding_var, width=60)
-            embedding_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            widgets["entry"].append(embedding_entry)
-            
-            def browse_embedding():
-                from tkinter import filedialog
-                # For embedding models, we want to select a file, not a directory
-                filename = filedialog.askopenfilename(
-                    title="Select Embedding Model (optional)",
-                    filetypes=[("GGUF files", "*.gguf"), ("All files", "*.*")]
-                )
-                if filename:
-                    embedding_var.set(filename)
-            
-            browse_embedding_btn = tk.Button(embedding_frame, text="Browse...", command=browse_embedding)
-            browse_embedding_btn.pack(side=tk.RIGHT, padx=(5, 0))
-            widgets["button"].append(browse_embedding_btn)
-            
-            # Server port configuration
-            port_label = tk.Label(main_frame, text="Server Port:", 
-                                font=("Arial", 10, "bold"))
-            port_label.pack(anchor=tk.W, pady=(10, 5))
-            widgets["label"].append(port_label)
-            
-            port_frame = tk.Frame(main_frame)
-            port_frame.pack(fill=tk.X, pady=(0, 10))
-            
-            port_var = tk.IntVar(value=self.config.get("port", 8080))
-            port_entry = tk.Entry(port_frame, textvariable=port_var, width=20)
-            port_entry.pack(side=tk.LEFT)
-            widgets["entry"].append(port_entry)
-            
-            port_help = tk.Label(port_frame, text="(default: 8080)", font=("Arial", 9), fg="gray")
-            port_help.pack(side=tk.LEFT, padx=(10, 0))
-            widgets["label"].append(port_help)
-            
-            # Buttons
-            button_frame = tk.Frame(main_frame)
-            button_frame.pack(pady=(20, 0))
-            
-            def save_setup():
-                llamacpp_dir = llamacpp_var.get().strip()
-                models_dir = models_var.get().strip()
-                embedding_model = embedding_var.get().strip()
-                port = port_var.get()
-                
-                if not llamacpp_dir or not models_dir:
-                    messagebox.showerror("Error", "Please fill in both directory paths.")
-                    return
-                
-                # Verify llama-server.exe exists
-                llama_server_path = Path(llamacpp_dir) / "llama-server.exe"
-                if not llama_server_path.exists():
-                    messagebox.showerror("Error", 
-                        f"llama-server.exe not found in:\n{llamacpp_dir}\n\n"
-                        "Please make sure you selected the correct llama.cpp build directory.")
-                    return
-                
-                # Save configuration
-                self.config["llamacpp_dir"] = llamacpp_dir
-                self.config["models_dir"] = models_dir
-                self.config["port"] = port
-                if embedding_model:  # Only save if not empty
-                    self.config["embedding_model"] = embedding_model
-                self.save_config()
-                
-                messagebox.showinfo("Success", 
-                    "Setup completed successfully!\n\n"
-                    "You can now start using Llama.cpp Tray.\n"
-                    "Right-click the tray icon for more options.")
+        root = ctk.CTk()
+        root.title("Llama.cpp Tray — First-Time Setup")
+        root.geometry("560x720")
+        root.resizable(False, False)
+        root.configure(fg_color=BG_DARK)
+
+        root.update_idletasks()
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry(f"560x720+{(sw-560)//2}+{(sh-720)//2}")
+        _make_window_foreground(root)
+
+        header = ctk.CTkFrame(root, fg_color=BG_CARD, corner_radius=0, height=72)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        ctk.CTkLabel(header, text="⚙  Welcome to Llama.cpp Tray",
+                     font=("Segoe UI", 17, "bold"), text_color=ACCENT).pack(
+            side="left", padx=24, pady=16)
+
+        scroll = ctk.CTkScrollableFrame(root, fg_color=BG_DARK)
+        scroll.pack(fill="both", expand=True, padx=0, pady=0)
+
+        ctk.CTkLabel(scroll,
+                     text="Configure the required paths before you can start the server.\n"
+                          "You can update everything later from the Configuration menu.",
+                     font=FONT_BODY, text_color=TEXT_DIM, wraplength=500,
+                     justify="left").pack(anchor="w", padx=24, pady=(12, 4))
+
+        def browse_dir_row(parent, label, initial=""):
+            _section_label(parent, label)
+            frm = ctk.CTkFrame(parent, fg_color="transparent")
+            frm.pack(fill="x", padx=24, pady=(2, 0))
+            var = ctk.StringVar(value=initial)
+            entry = ctk.CTkEntry(frm, textvariable=var, font=FONT_BODY,
+                                 height=36, fg_color=BG_MID, border_color=ACCENT2,
+                                 text_color=TEXT)
+            entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+            def browse():
+                d = filedialog.askdirectory(title=f"Select {label}")
+                if d:
+                    var.set(d)
+
+            ctk.CTkButton(frm, text="Browse…", width=90, height=36,
+                          fg_color=ACCENT2, hover_color=ACCENT,
+                          command=browse).pack(side="right")
+            return var
+
+        def browse_file_row(parent, label, initial=""):
+            _section_label(parent, label)
+            frm = ctk.CTkFrame(parent, fg_color="transparent")
+            frm.pack(fill="x", padx=24, pady=(2, 0))
+            var = ctk.StringVar(value=initial)
+            entry = ctk.CTkEntry(frm, textvariable=var, font=FONT_BODY,
+                                 height=36, fg_color=BG_MID, border_color=ACCENT2,
+                                 text_color=TEXT)
+            entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+            def browse():
+                f = filedialog.askopenfilename(
+                    title=f"Select {label}",
+                    filetypes=[("GGUF files", "*.gguf"), ("All files", "*.*")])
+                if f:
+                    var.set(f)
+
+            ctk.CTkButton(frm, text="Browse…", width=90, height=36,
+                          fg_color=ACCENT2, hover_color=ACCENT,
+                          command=browse).pack(side="right")
+            return var
+
+        llamacpp_var  = browse_dir_row(scroll, "Llama.cpp Directory  (contains llama-server.exe)\n    Example: .../llama.cpp/build/bin/Release",
+                                       self.config.get("llamacpp_dir", ""))
+        models_var    = browse_dir_row(scroll, "Models Directory  (contains .gguf files)",
+                                       self.config.get("models_dir", ""))
+        embedding_var = browse_file_row(scroll, "Embedding Model  (optional .gguf file)",
+                                        self.config.get("embedding_model", ""))
+
+        _section_label(scroll, "Server Port")
+        port_var = ctk.IntVar(value=self.config.get("port", 8080))
+        port_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        port_row.pack(fill="x", padx=24, pady=(2, 0))
+        ctk.CTkEntry(port_row, textvariable=port_var, width=120, height=36,
+                     fg_color=BG_MID, border_color=ACCENT2,
+                     text_color=TEXT, font=FONT_BODY).pack(side="left")
+        ctk.CTkLabel(port_row, text="  default: 8080", font=FONT_SMALL,
+                     text_color=TEXT_DIM).pack(side="left")
+
+        status_var = ctk.StringVar(value="")
+        status_lbl = ctk.CTkLabel(scroll, textvariable=status_var,
+                                  font=FONT_SMALL, text_color=DANGER)
+        status_lbl.pack(pady=(8, 0))
+
+        btn_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        btn_row.pack(pady=20)
+
+        def save_setup():
+            lcpp = llamacpp_var.get().strip()
+            mdir = models_var.get().strip()
+            embd = embedding_var.get().strip()
+            port = port_var.get()
+
+            if not lcpp or not mdir:
+                status_var.set("⚠  Please fill in both directory paths.")
+                return
+
+            server_exe = Path(lcpp) / "llama-server.exe"
+            if not server_exe.exists():
+                status_var.set("⚠  llama-server.exe not found in that directory.")
+                return
+
+            self.config["llamacpp_dir"] = lcpp
+            self.config["models_dir"]   = mdir
+            self.config["port"]         = port
+            if embd:
+                self.config["embedding_model"] = embd
+            self.save_config()
+            status_var.set("")
+            messagebox.showinfo("Setup Complete",
+                                "All set! Right-click the tray icon to get started.")
+            root.destroy()
+
+        def skip_setup():
+            if messagebox.askyesno("Skip Setup",
+                                   "Skip for now?\n\n"
+                                   "You'll need to set the paths manually from the "
+                                   "Configuration menu before starting the server."):
                 root.destroy()
-            
-            save_btn = tk.Button(button_frame, text="Save & Continue", command=save_setup, 
-                               width=15, height=2)
-            save_btn.pack(side=tk.LEFT, padx=(0, 10))
-            
-            def skip_setup():
-                result = messagebox.askyesno("Skip Setup", 
-                    "Are you sure you want to skip setup?\n\n"
-                    "You'll need to configure the paths manually from the Configuration menu "
-                    "before you can start the server.")
-                if result:
-                    root.destroy()
-            
-            skip_btn = tk.Button(button_frame, text="Skip", command=skip_setup, width=10)
-            skip_btn.pack(side=tk.LEFT)
-            
-            root.mainloop()
-        except Exception as e:
-            messagebox.showerror("Setup Error", f"Failed to show setup wizard: {e}")
-    
-    def show_config(self, icon, item):
-        """Show configuration window"""
-        try:
-            root = tk.Tk()
-            root.title("Llama.cpp Configuration")
-            root.geometry("400x770")
-            root.resizable(False, False)
-            
-            root.update_idletasks()
-            width = root.winfo_width()
-            height = root.winfo_height()
-            screen_width = root.winfo_screenwidth()
-            screen_height = root.winfo_screenheight()
-            x = screen_width - width - 20
-            y = screen_height - height - 60
-            root.geometry(f"{width}x{height}+{x}+{y}")
-            
-            themes = {
-                "light": {
-                    "bg": "#ffffff",
-                    "fg": "#000000",
-                    "entry_bg": "#f0f0f0",
-                    "button_bg": "#e0e0e0"
-                },
-                "dark": {
-                    "bg": "#2b2b2b",
-                    "fg": "#ffffff",
-                    "entry_bg": "#404040",
-                    "button_bg": "#555555"
-                }
-            }
-            
-            current_theme = self.config.get("theme", "dark")
-            colors = themes[current_theme]
-            widgets = {}
-            
-            def apply_theme(theme_name):
-                nonlocal colors, current_theme, widgets
-                colors = themes[theme_name]
-                current_theme = theme_name
-                
-                root.configure(bg=colors["bg"])
-                
-                for widget_type, widget_list in widgets.items():
-                    for widget in widget_list:
-                        if widget_type == "label":
-                            widget.configure(bg=colors["bg"], fg=colors["fg"])
-                        elif widget_type == "entry":
-                            widget.configure(bg=colors["entry_bg"], fg=colors["fg"], insertbackground=colors["fg"])
-                        elif widget_type == "checkbutton":
-                            widget.configure(bg=colors["bg"], fg=colors["fg"], selectcolor=colors["entry_bg"])
-                        elif widget_type == "button":
-                            widget.configure(bg=colors["button_bg"], fg=colors["fg"])
-                        elif widget_type == "frame":
-                            widget.configure(bg=colors["bg"])
-                
-                theme_button.config(text=f"Theme: {current_theme.capitalize()}", bg=colors["button_bg"], fg=colors["fg"])
-            
-            root.configure(bg=colors["bg"])
-            
-            theme_frame = tk.Frame(root, bg=colors["bg"])
-            theme_frame.pack(pady=5)
-            widgets["frame"] = widgets.get("frame", []) + [theme_frame]
-            
-            def toggle_theme():
-                new_theme = "light" if current_theme == "dark" else "dark"
-                apply_theme(new_theme)
-            
-            theme_button = tk.Button(theme_frame, text=f"Theme: {current_theme.capitalize()}", command=toggle_theme, bg=colors["button_bg"], fg=colors["fg"])
-            theme_button.pack()
-            widgets["button"] = widgets.get("button", []) + [theme_button]
-            
-            context_label = tk.Label(root, text="Context Window Size:", bg=colors["bg"], fg=colors["fg"])
-            context_label.pack(pady=10)
-            widgets["label"] = widgets.get("label", []) + [context_label]
-            
-            context_frame = tk.Frame(root, bg=colors["bg"])
-            context_frame.pack(pady=5)
-            widgets["frame"] = widgets.get("frame", []) + [context_frame]
-            
-            context_var = tk.IntVar(value=self.config["context_window"])
-            context_slider = ttk.Scale(
-                context_frame, 
-                from_=1000, 
-                to=256000, 
-                variable=context_var,
-                orient="horizontal",
-                length=200,
-                command=lambda v: update_context_value(int(float(v)))
-            )
-            context_slider.pack(side=tk.LEFT, padx=5)
-            
-            context_entry = tk.Entry(context_frame, textvariable=context_var, width=10, bg=colors["entry_bg"], fg=colors["fg"], insertbackground=colors["fg"])
-            context_entry.pack(side=tk.LEFT, padx=5)
-            widgets["entry"] = widgets.get("entry", []) + [context_entry]
-            
-            context_value_label = tk.Label(root, text=f"Context: {context_var.get()}", bg=colors["bg"], fg=colors["fg"])
-            context_value_label.pack()
-            widgets["label"] = widgets.get("label", []) + [context_value_label]
-            
-            def update_context_value(value):
-                context_var.set(value)
-                context_value_label.config(text=f"Context: {value}")
-            
-            port_label = tk.Label(root, text="Port:", bg=colors["bg"], fg=colors["fg"])
-            port_label.pack(pady=10)
-            widgets["label"] = widgets.get("label", []) + [port_label]
-            
-            port_var = tk.IntVar(value=self.config["port"])
-            port_entry = tk.Entry(root, textvariable=port_var, width=10, bg=colors["entry_bg"], fg=colors["fg"], insertbackground=colors["fg"])
-            port_entry.pack()
-            widgets["entry"] = widgets.get("entry", []) + [port_entry]
-            
-            max_models_label = tk.Label(root, text="Max Models:", bg=colors["bg"], fg=colors["fg"])
-            max_models_label.pack(pady=10)
-            widgets["label"] = widgets.get("label", []) + [max_models_label]
-            
-            max_models_var = tk.IntVar(value=self.config.get("max_models", 1))
-            max_models_entry = tk.Entry(root, textvariable=max_models_var, width=10, bg=colors["entry_bg"], fg=colors["fg"], insertbackground=colors["fg"])
-            max_models_entry.pack()
-            widgets["entry"] = widgets.get("entry", []) + [max_models_entry]
-            
-            models_dir_label = tk.Label(root, text="Models Directory:", bg=colors["bg"], fg=colors["fg"])
-            models_dir_label.pack(pady=10)
-            widgets["label"] = widgets.get("label", []) + [models_dir_label]
-            
-            models_dir_var = tk.StringVar(value=self.config["models_dir"])
-            models_entry = tk.Entry(root, textvariable=models_dir_var, width=50, bg=colors["entry_bg"], fg=colors["fg"], insertbackground=colors["fg"])
-            models_entry.pack(pady=5)
-            widgets["entry"] = widgets.get("entry", []) + [models_entry]
-            
-            llamacpp_dir_label = tk.Label(root, text="Llama.cpp Directory:", bg=colors["bg"], fg=colors["fg"])
-            llamacpp_dir_label.pack(pady=10)
-            widgets["label"] = widgets.get("label", []) + [llamacpp_dir_label]
-            
-            llamacpp_dir_var = tk.StringVar(value=self.config["llamacpp_dir"])
-            llamacpp_dir_entry = tk.Entry(root, textvariable=llamacpp_dir_var, width=50, bg=colors["entry_bg"], fg=colors["fg"], insertbackground=colors["fg"])
-            llamacpp_dir_entry.pack(pady=5)
-            widgets["entry"] = widgets.get("entry", []) + [llamacpp_dir_entry]
-            
-            fit_var = tk.BooleanVar(value=self.config.get("use_fit", False))
-            fit_check = tk.Checkbutton(root, text="Use --fit flag (auto context size)", variable=fit_var, bg=colors["bg"], fg=colors["fg"], selectcolor=colors["entry_bg"])
-            fit_check.pack(pady=10)
-            widgets["checkbutton"] = widgets.get("checkbutton", []) + [fit_check]
-            
-            flags_label = tk.Label(root, text="Additional Flags:", bg=colors["bg"], fg=colors["fg"])
-            flags_label.pack(pady=10)
-            widgets["label"] = widgets.get("label", []) + [flags_label]
-            
-            flags_frame = tk.Frame(root, bg=colors["bg"])
-            flags_frame.pack(pady=5)
-            widgets["frame"] = widgets.get("frame", []) + [flags_frame]
-            
-            flags_var = tk.StringVar(value=" ".join(self.config.get("flags", [])))
-            flags_entry = tk.Entry(flags_frame, textvariable=flags_var, width=50, bg=colors["entry_bg"], fg=colors["fg"], insertbackground=colors["fg"])
-            flags_entry.pack(side=tk.LEFT, padx=5)
-            widgets["entry"] = widgets.get("entry", []) + [flags_entry]
-            
-            flags_help_label = tk.Label(root, text="Enter flags separated by spaces (e.g., --gpu-layers 35 --threads 8)", font=("Arial", 8), bg=colors["bg"], fg=colors["fg"])
-            flags_help_label.pack()
-            widgets["label"] = widgets.get("label", []) + [flags_help_label]
-            
-            separator_frame = tk.Frame(root, bg=colors["bg"], height=2)
-            separator_frame.pack(pady=15, fill=tk.X)
-            widgets["frame"] = widgets.get("frame", []) + [separator_frame]
-            
-            embedding_label = tk.Label(root, text="Embedding Server Configuration", font=("Arial", 10, "bold"), bg=colors["bg"], fg=colors["fg"])
-            embedding_label.pack(pady=5)
-            widgets["label"] = widgets.get("label", []) + [embedding_label]
-            
-            embedding_model_label = tk.Label(root, text="Embedding Model:", bg=colors["bg"], fg=colors["fg"])
-            embedding_model_label.pack(pady=5)
-            widgets["label"] = widgets.get("label", []) + [embedding_model_label]
-            
-            embedding_model_var = tk.StringVar(value=self.config.get("embedding_model", ""))
-            embedding_model_entry = tk.Entry(root, textvariable=embedding_model_var, width=60, bg=colors["entry_bg"], fg=colors["fg"], insertbackground=colors["fg"])
-            embedding_model_entry.pack(pady=5)
-            widgets["entry"] = widgets.get("entry", []) + [embedding_model_entry]
-            
-            embedding_port_label = tk.Label(root, text="Embedding Port:", bg=colors["bg"], fg=colors["fg"])
-            embedding_port_label.pack(pady=5)
-            widgets["label"] = widgets.get("label", []) + [embedding_port_label]
-            
-            embedding_port_var = tk.IntVar(value=self.config.get("embedding_port", 8082))
-            embedding_port_entry = tk.Entry(root, textvariable=embedding_port_var, width=10, bg=colors["entry_bg"], fg=colors["fg"], insertbackground=colors["fg"])
-            embedding_port_entry.pack()
-            widgets["entry"] = widgets.get("entry", []) + [embedding_port_entry]
-            
-            button_frame = tk.Frame(root, bg=colors["bg"])
-            button_frame.pack(pady=20)
-            widgets["frame"] = widgets.get("frame", []) + [button_frame]
-            
-            def save_and_close():
-                self.config["context_window"] = context_var.get()
-                self.config["port"] = port_var.get()
-                self.config["max_models"] = max_models_var.get()
-                self.config["models_dir"] = models_dir_var.get()
-                self.config["llamacpp_dir"] = llamacpp_dir_var.get()
-                self.config["use_fit"] = fit_var.get()
-                self.config["theme"] = current_theme
-                self.config["embedding_model"] = embedding_model_var.get()
-                self.config["embedding_port"] = embedding_port_var.get()
-                
-                flags_text = flags_var.get().strip()
-                if flags_text:
-                    self.config["flags"] = flags_text.split()
+
+        ctk.CTkButton(btn_row, text="Save & Continue", width=160, height=40,
+                      fg_color=SUCCESS, hover_color="#2fa882",
+                      font=FONT_HEADER, command=save_setup).pack(side="left", padx=8)
+        ctk.CTkButton(btn_row, text="Skip", width=80, height=40,
+                      fg_color=BG_CARD, hover_color=BG_MID,
+                      font=FONT_BODY, command=skip_setup).pack(side="left", padx=8)
+
+        root.mainloop()
+
+    # ════════════════════════════════════════════════════════════════════════
+    #  CONFIGURATION WINDOW
+    # ════════════════════════════════════════════════════════════════════════
+    def show_config(self, icon=None, item=None):
+        root = ctk.CTk()
+        root.title("Llama.cpp — Configuration")
+        root.resizable(True, True)
+        root.minsize(500, 700)
+        root.configure(fg_color=BG_DARK)
+
+        root.update_idletasks()
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        margin = 50
+        x_pos = sw - 620 - margin
+        y_pos = max(0, sh - 900)
+        root.geometry(f"620x860+{x_pos}+{y_pos}")
+        root.lift()
+        root.attributes("-topmost", True)
+        root.focus_force()
+        root.after(150, lambda: root.attributes("-topmost", False))
+
+        hdr = ctk.CTkFrame(root, fg_color=BG_CARD, corner_radius=0, height=64)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        ctk.CTkLabel(hdr, text="⚙  Configuration",
+                     font=("Segoe UI", 16, "bold"), text_color=ACCENT).pack(
+            side="left", padx=20, pady=14)
+
+        status_text = "● Running" if self.server_running else "● Stopped"
+        status_col  = SUCCESS if self.server_running else DANGER
+        status_pill = ctk.CTkLabel(hdr, text=status_text,
+                                   font=("Segoe UI", 10, "bold"),
+                                   text_color=status_col,
+                                   fg_color=BG_MID, corner_radius=8,
+                                   padx=10, pady=4)
+        status_pill.pack(side="right", padx=20)
+
+        scroll = ctk.CTkScrollableFrame(root, fg_color=BG_DARK)
+        scroll.pack(fill="both", expand=True)
+
+        def lentry(parent, label, var, width=None, placeholder=""):
+            frm = ctk.CTkFrame(parent, fg_color="transparent")
+            frm.pack(fill="x", padx=24, pady=3)
+            ctk.CTkLabel(frm, text=label, font=FONT_BODY,
+                         text_color=TEXT, width=200, anchor="w").pack(side="left")
+            kw = dict(textvariable=var, height=34, fg_color=BG_MID,
+                      border_color=ACCENT2, text_color=TEXT,
+                      font=FONT_BODY, placeholder_text=placeholder)
+            if width:
+                kw["width"] = width
+            e = ctk.CTkEntry(frm, **kw)
+            e.pack(side="left", fill="x", expand=True)
+            return e
+
+        def browse_row(parent, label, var, mode="dir"):
+            frm = ctk.CTkFrame(parent, fg_color="transparent")
+            frm.pack(fill="x", padx=24, pady=3)
+            ctk.CTkLabel(frm, text=label, font=FONT_BODY,
+                         text_color=TEXT, width=200, anchor="w").pack(side="left")
+            entry = ctk.CTkEntry(frm, textvariable=var, height=34,
+                                 fg_color=BG_MID, border_color=ACCENT2,
+                                 text_color=TEXT, font=FONT_BODY)
+            entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+            def browse():
+                if mode == "dir":
+                    d = filedialog.askdirectory(title=f"Select {label}")
+                    if d:
+                        var.set(d)
                 else:
-                    self.config["flags"] = []
-                
-                if self.save_config():
-                    root.destroy()
-                    messagebox.showinfo("Success", "Configuration saved successfully!")
-                else:
-                    messagebox.showerror("Error", "Failed to save configuration")
-            
-            def reset_to_default():
-                context_var.set(32000)
-                port_var.set(8081)
+                    f = filedialog.askopenfilename(
+                        title=f"Select {label}",
+                        filetypes=[("GGUF files", "*.gguf"), ("All files", "*.*")])
+                    if f:
+                        var.set(f)
+
+            ctk.CTkButton(frm, text="…", width=36, height=34,
+                          fg_color=ACCENT2, hover_color=ACCENT,
+                          command=browse).pack(side="right")
+
+        # ── SECTION: Server ─────────────────────────────────────────────────
+        _section_label(scroll, "Server")
+
+        ctx_var     = ctk.IntVar(value=self.config["context_window"])
+        ctx_lbl_var = ctk.StringVar(value=f"Context: {ctx_var.get():,}")
+
+        ctx_frm = ctk.CTkFrame(scroll, fg_color="transparent")
+        ctx_frm.pack(fill="x", padx=24, pady=3)
+        ctk.CTkLabel(ctx_frm, text="Context Window", font=FONT_BODY,
+                     text_color=TEXT, width=200, anchor="w").pack(side="left")
+        slider = ctk.CTkSlider(ctx_frm, from_=1000, to=256000,
+                               variable=ctx_var, width=220,
+                               button_color=ACCENT, progress_color=ACCENT2,
+                               command=lambda v: [ctx_var.set(int(v)),
+                                                  ctx_lbl_var.set(f"Context: {int(v):,}")])
+        slider.pack(side="left", padx=(0, 8))
+        ctk.CTkEntry(ctx_frm, textvariable=ctx_var, width=80, height=34,
+                     fg_color=BG_MID, border_color=ACCENT2,
+                     text_color=TEXT, font=FONT_BODY).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(ctx_frm, textvariable=ctx_lbl_var,
+                     font=FONT_SMALL, text_color=TEXT_DIM, width=140).pack(side="left")
+
+        port_var       = ctk.IntVar(value=self.config["port"])
+        max_models_var = ctk.IntVar(value=self.config.get("max_models", 1))
+        lentry(scroll, "Server Port",  port_var,       width=100)
+        lentry(scroll, "Max Models",   max_models_var, width=100)
+
+        fit_var       = ctk.BooleanVar(value=self.config.get("use_fit", False))
+        no_mmproj_var = ctk.BooleanVar(value=self.config.get("no_mmproj", False))
+        flash_attn_var = ctk.BooleanVar(value=self.config.get("flash_attn", False))
+        ctk_q8_var    = ctk.BooleanVar(value=self.config.get("ctk_q8", False))
+        ctv_q8_var    = ctk.BooleanVar(value=self.config.get("ctv_q8", False))
+        thinking_var  = ctk.StringVar(value=self.config.get("thinking", "off"))
+
+        toggles_frm = ctk.CTkFrame(scroll, fg_color="transparent")
+        toggles_frm.pack(fill="x", padx=24, pady=3)
+        ctk.CTkLabel(toggles_frm, text="Quick Flags", font=FONT_BODY,
+                     text_color=TEXT, width=200, anchor="w").pack(side="left")
+        ctk.CTkSwitch(toggles_frm, variable=fit_var, text="--fit",
+                      font=FONT_BODY, text_color=TEXT_DIM,
+                      button_color=ACCENT, progress_color=ACCENT2).pack(side="left", padx=(0, 24))
+        ctk.CTkSwitch(toggles_frm, variable=no_mmproj_var, text="--no-mmproj",
+                      font=FONT_BODY, text_color=TEXT_DIM,
+                      button_color=ACCENT, progress_color=ACCENT2).pack(side="left", padx=(0, 24))
+        ctk.CTkSwitch(toggles_frm, variable=flash_attn_var, text="--flash-attn on",
+                      font=FONT_BODY, text_color=TEXT_DIM,
+                      button_color=ACCENT, progress_color=ACCENT2).pack(side="left")
+
+        kv_frm = ctk.CTkFrame(scroll, fg_color="transparent")
+        kv_frm.pack(fill="x", padx=24, pady=3)
+        ctk.CTkLabel(kv_frm, text="KV Cache  (q8_0)", font=FONT_BODY,
+                     text_color=TEXT, width=200, anchor="w").pack(side="left")
+        ctk.CTkSwitch(kv_frm, variable=ctk_q8_var, text="-ctk q8_0",
+                      font=FONT_BODY, text_color=TEXT_DIM,
+                      button_color=ACCENT, progress_color=ACCENT2).pack(side="left", padx=(0, 24))
+        ctk.CTkSwitch(kv_frm, variable=ctv_q8_var, text="-ctv q8_0",
+                      font=FONT_BODY, text_color=TEXT_DIM,
+                      button_color=ACCENT, progress_color=ACCENT2).pack(side="left")
+        ctk.CTkLabel(kv_frm, text="",
+                     font=FONT_SMALL, text_color=TEXT_DIM).pack(side="left", padx=(12, 0))
+
+        think_frm = ctk.CTkFrame(scroll, fg_color="transparent")
+        think_frm.pack(fill="x", padx=24, pady=3)
+        ctk.CTkLabel(think_frm, text="Thinking Mode", font=FONT_BODY,
+                     text_color=TEXT, width=200, anchor="w").pack(side="left")
+        ctk.CTkSegmentedButton(think_frm, values=["off", "true", "false"],
+                               variable=thinking_var, font=FONT_BODY,
+                               selected_color=ACCENT, selected_hover_color=ACCENT2,
+                               unselected_color=BG_CARD, unselected_hover_color=BG_MID,
+                               text_color=TEXT).pack(side="left")
+        ctk.CTkLabel(think_frm, text="   off = don't pass flag,  true/false = explicit",
+                     font=FONT_SMALL, text_color=TEXT_DIM).pack(side="left", padx=(10, 0))
+
+        _managed = {"--no-mmproj", "--fit", "--flash-attn", "-ctk", "-ctv", "q8_0", "on",
+                    "--chat-template-kwargs"}
+        raw_flags   = self.config.get("flags", [])
+        clean_flags = []
+        skip_next   = False
+        for f in raw_flags:
+            if skip_next:
+                skip_next = False
+                continue
+            if f == "--chat-template-kwargs":
+                skip_next = True
+                continue
+            if f not in _managed:
+                clean_flags.append(f)
+        flags_var = ctk.StringVar(value=" ".join(clean_flags))
+        lentry(scroll, "Additional Flags", flags_var,
+               placeholder="e.g. --gpu-layers 35 --threads 8")
+        ctk.CTkLabel(scroll, text="",
+                     font=FONT_SMALL, text_color=TEXT_DIM).pack(anchor="w", padx=24)
+
+        # ── SECTION: Paths ──────────────────────────────────────────────────
+        _section_label(scroll, "Paths")
+
+        models_dir_var   = ctk.StringVar(value=self.config.get("models_dir", ""))
+        llamacpp_dir_var = ctk.StringVar(value=self.config.get("llamacpp_dir", ""))
+        browse_row(scroll, "Models Directory",    models_dir_var,   mode="dir")
+        browse_row(scroll, "Llama.cpp Directory", llamacpp_dir_var, mode="dir")
+
+        # ── SECTION: Embedding Server ────────────────────────────────────────
+        _section_label(scroll, "Embedding Server  (optional)")
+
+        embedding_model_var = ctk.StringVar(value=self.config.get("embedding_model", ""))
+        embedding_port_var  = ctk.IntVar(value=self.config.get("embedding_port", 8082))
+        embedding_flags_var = ctk.StringVar(value=" ".join(self.config.get("embedding_flags", [])))
+        browse_row(scroll, "Embedding Model (.gguf)", embedding_model_var, mode="file")
+        lentry(scroll, "Embedding Port",        embedding_port_var,  width=100)
+        lentry(scroll, "Embedding Extra Flags", embedding_flags_var,
+               placeholder="e.g. --threads 4")
+        ctk.CTkLabel(scroll, text="   Space-separated, applied to embedding server only",
+                     font=FONT_SMALL, text_color=TEXT_DIM).pack(anchor="w", padx=24)
+
+        feedback_var = ctk.StringVar(value="")
+        feedback_lbl = ctk.CTkLabel(scroll, textvariable=feedback_var,
+                                    font=FONT_SMALL, text_color=SUCCESS)
+        feedback_lbl.pack(pady=(6, 0))
+
+        btn_frm = ctk.CTkFrame(root, fg_color=BG_MID, corner_radius=0, height=60)
+        btn_frm.pack(fill="x", side="bottom")
+        btn_frm.pack_propagate(False)
+
+        def save_and_close():
+            self.config["context_window"]  = ctx_var.get()
+            self.config["port"]            = port_var.get()
+            self.config["max_models"]      = max_models_var.get()
+            self.config["models_dir"]      = models_dir_var.get()
+            self.config["llamacpp_dir"]    = llamacpp_dir_var.get()
+            self.config["use_fit"]         = fit_var.get()
+            self.config["no_mmproj"]       = no_mmproj_var.get()
+            self.config["flash_attn"]      = flash_attn_var.get()
+            self.config["ctk_q8"]          = ctk_q8_var.get()
+            self.config["ctv_q8"]          = ctv_q8_var.get()
+            self.config["thinking"]        = thinking_var.get()
+            self.config["embedding_model"] = embedding_model_var.get()
+            self.config["embedding_port"]  = embedding_port_var.get()
+
+            base_flags = flags_var.get().strip().split() if flags_var.get().strip() else []
+            if fit_var.get():
+                base_flags += ["--fit", "on"]
+            if no_mmproj_var.get():
+                base_flags.append("--no-mmproj")
+            if flash_attn_var.get():
+                base_flags += ["--flash-attn", "on"]
+            if ctk_q8_var.get():
+                base_flags += ["-ctk", "q8_0"]
+            if ctv_q8_var.get():
+                base_flags += ["-ctv", "q8_0"]
+            # ── FIX: store thinking kwargs as plain list items, no f-string ──
+            if thinking_var.get() != "off":
+                base_flags += ["--chat-template-kwargs",
+                               '{"enable_thinking": ' + thinking_var.get() + '}']
+            self.config["flags"] = base_flags
+
+            emb = embedding_flags_var.get().strip()
+            self.config["embedding_flags"] = emb.split() if emb else []
+
+            if self.save_config():
+                messagebox.showinfo("Saved", "Configuration saved successfully!")
+                root.destroy()
+            else:
+                feedback_var.set("⚠  Failed to save — check file permissions.")
+
+        def reset_defaults():
+            if messagebox.askyesno("Reset", "Reset all values to defaults?"):
+                ctx_var.set(32000)
+                ctx_lbl_var.set("Context: 32,000")
+                port_var.set(8080)
                 max_models_var.set(1)
                 models_dir_var.set("")
                 llamacpp_dir_var.set("")
                 fit_var.set(False)
+                no_mmproj_var.set(False)
+                flash_attn_var.set(False)
+                ctk_q8_var.set(False)
+                ctv_q8_var.set(False)
+                thinking_var.set("off")
                 flags_var.set("")
                 embedding_model_var.set("")
                 embedding_port_var.set(8082)
-                context_value_label.config(text=f"Context: {context_var.get()}")
-            
-            save_button = tk.Button(button_frame, text="Save", command=save_and_close, width=10, bg=colors["button_bg"], fg=colors["fg"])
-            save_button.pack(side=tk.LEFT, padx=5)
-            widgets["button"] = widgets.get("button", []) + [save_button]
-            
-            cancel_button = tk.Button(button_frame, text="Cancel", command=root.destroy, width=10, bg=colors["button_bg"], fg=colors["fg"])
-            cancel_button.pack(side=tk.LEFT, padx=5)
-            widgets["button"] = widgets.get("button", []) + [cancel_button]
-            
-            reset_button = tk.Button(button_frame, text="Reset to Default", command=reset_to_default, width=12, bg=colors["button_bg"], fg=colors["fg"])
-            reset_button.pack(side=tk.LEFT, padx=5)
-            widgets["button"] = widgets.get("button", []) + [reset_button]
-            
-            root.mainloop()
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to open config window: {e}")
-    
+                embedding_flags_var.set("")
+
+        ctk.CTkButton(btn_frm, text="Save", width=110, height=38,
+                      fg_color=SUCCESS, hover_color="#2fa882",
+                      font=FONT_HEADER, command=save_and_close).pack(
+            side="left", padx=(20, 6), pady=11)
+        ctk.CTkButton(btn_frm, text="Cancel", width=90, height=38,
+                      fg_color=BG_CARD, hover_color=BG_MID,
+                      font=FONT_BODY, command=root.destroy).pack(
+            side="left", padx=6, pady=11)
+        ctk.CTkButton(btn_frm, text="Reset Defaults", width=120, height=38,
+                      fg_color=DANGER, hover_color="#c04040",
+                      font=FONT_BODY, command=reset_defaults).pack(
+            side="right", padx=20, pady=11)
+
+        root.mainloop()
+
+    # ════════════════════════════════════════════════════════════════════════
+    #  BATCH FILE GENERATION
+    #  Key rule: never use f-strings for the batch file body — cmd.exe eats
+    #  bare { } characters.  Build every line with plain string concatenation.
+    # ════════════════════════════════════════════════════════════════════════
     def create_custom_batch(self):
-        """Create a custom batch file with current config"""
         custom_bat = Path(__file__).parent / "server_llamacpp.bat"
-        
+
         if self.config.get("use_fit", False):
             context_param = "--fit on"
         else:
-            context_param = f"-c {self.config['context_window']}"
-        
-        flags_str = " " + " ".join(self.config["flags"])
-        
-        content = f"""@echo off
-setlocal
+            context_param = "-c " + str(self.config["context_window"])
 
-set "LLAMA_EXE=llama-server.exe"
-set "LLAMA_DIR={self.config.get('llamacpp_dir', '')}"
-set "MODELS_DIR={self.config['models_dir']}"
+        # Build the flags string — replace any bare { } from the
+        # --chat-template-kwargs value with CMD-safe escaped versions.
+        safe_flags_parts = []
+        flags = self.config.get("flags", [])
+        i = 0
+        while i < len(flags):
+            flag = flags[i]
+            if flag == "--chat-template-kwargs" and i + 1 < len(flags):
+                # The JSON value must have its quotes escaped for CMD
+                json_val = flags[i + 1]
+                # Wrap in double-quotes, escape inner double-quotes as \"
+                escaped = '"' + json_val.replace('"', '\\"') + '"'
+                safe_flags_parts.append("--chat-template-kwargs")
+                safe_flags_parts.append(escaped)
+                i += 2
+            else:
+                safe_flags_parts.append(flag)
+                i += 1
 
-:: Check if llama-server is running
-tasklist /FI "IMAGENAME eq %LLAMA_EXE%" 2>NUL | find /I "%LLAMA_EXE%" >NUL
+        flags_str = " ".join(safe_flags_parts)
 
-if "%ERRORLEVEL%"=="0" (
-    echo llama-server is running. Shutting it down...
-    taskkill /IM "%LLAMA_EXE%" /T /F >NUL 2>&1
-) else (
-    echo llama-server is not running. Starting it...
-    pushd "%LLAMA_DIR%"
-if "%LLAMA_DIR%"=="" (
-    echo ERROR: llama.cpp directory not configured. Please set it in Configuration.
-    pause
-    exit /b 1
-)
-start "llama.cpp server" "%LLAMA_EXE%" --models-dir "%MODELS_DIR%" {context_param} --models-max {self.config.get('max_models', 1)} --port {self.config['port']} {flags_str}
-    popd
-)
+        llama_dir   = self.config.get("llamacpp_dir", "")
+        models_dir  = self.config["models_dir"]
+        port        = str(self.config["port"])
+        max_models  = str(self.config.get("max_models", 1))
 
-timeout /t 1 /nobreak >NUL
-endlocal
-exit"""
+        # Build bat using plain concatenation — zero f-strings touching user data
+        lines = [
+            "@echo off",
+            "setlocal",
+            "",
+            'set "LLAMA_EXE=llama-server.exe"',
+            'set "LLAMA_DIR=' + llama_dir + '"',
+            'set "MODELS_DIR=' + models_dir + '"',
+            "",
+            'tasklist /FI "IMAGENAME eq %LLAMA_EXE%" 2>NUL | find /I "%LLAMA_EXE%" >NUL',
+            "",
+            'if "%ERRORLEVEL%"=="0" (',
+            "    echo llama-server is running. Shutting it down...",
+            "    taskkill /IM \"%LLAMA_EXE%\" /T /F >NUL 2>&1",
+            ") else (",
+            "    echo llama-server is not running. Starting it...",
+            '    if "%LLAMA_DIR%"=="" (',
+            "        echo ERROR: llama.cpp directory not configured. Please set it in Configuration.",
+            "        pause",
+            "        exit /b 1",
+            "    )",
+            '    pushd "%LLAMA_DIR%"',
+            '    start "llama.cpp server" "%LLAMA_EXE%"'
+            + ' --models-dir "%MODELS_DIR%"'
+            + " " + context_param
+            + " --models-max " + max_models
+            + " --port " + port
+            + (" " + flags_str if flags_str.strip() else ""),
+            "    popd",
+            ")",
+            "",
+            "timeout /t 1 /nobreak >NUL",
+            "endlocal",
+            "exit",
+        ]
+        content = "\r\n".join(lines)
+
         try:
-            with open(custom_bat, 'w') as f:
+            with open(custom_bat, 'w', newline='') as f:
                 f.write(content)
             return custom_bat
-        except:
+        except Exception:
             return self.bat_file
-    
+
+    # ════════════════════════════════════════════════════════════════════════
+    #  Server control
+    # ════════════════════════════════════════════════════════════════════════
     def toggle_server(self, icon, item):
-        """Toggle server on/off"""
         try:
             custom_bat = self.create_custom_batch()
             subprocess.run([str(custom_bat)], shell=True, check=True)
@@ -669,357 +710,253 @@ exit"""
             self.update_status()
         except subprocess.CalledProcessError as e:
             print(f"Error running batch file: {e}")
-    
+
     def start_server_internal(self):
-        """Internal method to start server"""
         if not self.server_running:
-            # Check if required configuration is set
-            if not self.config.get('llamacpp_dir', '').strip() or not self.config.get('models_dir', '').strip():
+            if not self.config.get('llamacpp_dir', '').strip() or \
+               not self.config.get('models_dir', '').strip():
                 print("ERROR: Required paths not configured. Showing setup wizard...")
                 self.show_setup_wizard()
                 return
-            
             try:
                 print("Starting server...")
                 custom_bat = self.create_custom_batch()
                 subprocess.run([str(custom_bat)], shell=True, check=True)
                 time.sleep(2)
                 self.update_status()
-                print(f"Server started. Running: {self.server_running}")
             except subprocess.CalledProcessError as e:
                 print(f"Error starting server: {e}")
-    
+
     def start_server(self, icon, item):
-        """Start server only if not running"""
         self.start_server_internal()
-    
+
     def stop_server(self, icon, item):
-        """Stop server only if running"""
         if self.server_running:
             try:
-                subprocess.run(['taskkill', '/IM', 'llama-server.exe', '/T', '/F'], 
-                             shell=True, check=True)
+                subprocess.run(['taskkill', '/IM', 'llama-server.exe', '/T', '/F'],
+                               shell=True, check=True)
                 time.sleep(1)
             except subprocess.CalledProcessError as e:
                 print(f"Error stopping server: {e}")
-        
-        # Also stop embedding server if it's running
+
         if self.embedding_server_running:
             try:
-                print("Stopping embedding server...")
-                result = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq llama-server.exe', '/V'], 
-                                      capture_output=True, text=True, shell=True)
-                
-                # Find the specific embedding server process by port or command line
-                embedding_pid = None
+                result = subprocess.run(
+                    ['tasklist', '/FI', 'IMAGENAME eq llama-server.exe', '/V'],
+                    capture_output=True, text=True, shell=True)
                 for line in result.stdout.split('\n'):
-                    if f":{self.config['embedding_port']}" in line or 'embedding' in line.lower():
-                        try:
-                            parts = line.split()
-                            if len(parts) > 1:
-                                embedding_pid = parts[1]  # PID is usually the second column
-                                break
-                        except:
-                            continue
-                
-                if embedding_pid:
-                    try:
-                        subprocess.run(['taskkill', '/PID', embedding_pid, '/F'], shell=True, check=True)
-                        print(f"Killed embedding server process {embedding_pid}")
-                    except Exception as e:
-                        print(f"Error killing embedding server process: {e}")
-                else:
-                    print("Could not find embedding server process to kill")
-                    
+                    if (f":{self.config['embedding_port']}" in line
+                            or 'embedding' in line.lower()):
+                        parts = line.split()
+                        if len(parts) > 1:
+                            try:
+                                subprocess.run(['taskkill', '/PID', parts[1], '/F'],
+                                               shell=True, check=True)
+                            except Exception:
+                                pass
+                            break
             except Exception as e:
                 print(f"Error stopping embedding server: {e}")
-        
-        # Update status after stopping both servers
+
         time.sleep(1)
         self.update_status()
-    
+
     def toggle_embedding_server(self, icon, item):
-        """Toggle embedding server on/off"""
-        # print(f"DEBUG: toggle_embedding_server called. Current status: {self.embedding_server_running}")
         try:
             if self.embedding_server_running:
-                # Stop embedding server
-                print("Stopping embedding server...")
-                
-                # More precise process detection - look for embedding server specifically
-                result = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq llama-server.exe', '/V'], 
-                                      capture_output=True, text=True, shell=True)
-                # print(f"DEBUG: tasklist result:\n{result.stdout}")
-                
-                # Find specific embedding server process by port or command line
-                embedding_pid = None
+                result = subprocess.run(
+                    ['tasklist', '/FI', 'IMAGENAME eq llama-server.exe', '/V'],
+                    capture_output=True, text=True, shell=True)
                 for line in result.stdout.split('\n'):
-                    if f":{self.config['embedding_port']}" in line or 'embedding' in line.lower():
-                        try:
-                            parts = line.split()
-                            if len(parts) > 1:
-                                embedding_pid = parts[1]  # PID is usually the second column
-                                break
-                        except:
-                            continue
-                
-                if embedding_pid:
-                    try:
-                        subprocess.run(['taskkill', '/PID', embedding_pid, '/F'], shell=True, check=True)
-                        print(f"Killed embedding server process {embedding_pid}")
-                    except Exception as e:
-                        print(f"Error killing embedding server process: {e}")
-                else:
-                    print("Could not find embedding server process to kill")
-                    
+                    if (f":{self.config['embedding_port']}" in line
+                            or 'embedding' in line.lower()):
+                        parts = line.split()
+                        if len(parts) > 1:
+                            try:
+                                subprocess.run(['taskkill', '/PID', parts[1], '/F'],
+                                               shell=True, check=True)
+                            except Exception:
+                                pass
+                            break
             else:
-                # Check if required configuration is set
-                if not self.config.get('llamacpp_dir', '').strip() or not self.config.get('embedding_model', '').strip():
-                    print("ERROR: Llama.cpp directory or embedding model not configured. Please configure in Settings.")
+                if not self.config.get('llamacpp_dir', '').strip() or \
+                   not self.config.get('embedding_model', '').strip():
+                    print("ERROR: Llama.cpp dir or embedding model not configured.")
                     return
-                
-                # Start embedding server
-                print("Starting embedding server...")
-                
-                # Create a temporary batch file for embedding server
-                embedding_bat = Path(__file__).parent / "server_embedding.bat"
-                embedding_content = f"""@echo off
-setlocal
 
-set "LLAMA_DIR={self.config.get('llamacpp_dir', '')}"
+                embedding_bat   = Path(__file__).parent / "server_embedding.bat"
+                emb_flags_str   = " ".join(self.config.get("embedding_flags", []))
+                emb_model       = self.config["embedding_model"]
+                emb_port        = str(self.config["embedding_port"])
+                llama_dir       = self.config.get("llamacpp_dir", "")
 
-if "%LLAMA_DIR%"=="" (
-    echo ERROR: llama.cpp directory not configured. Please set it in Configuration.
-    pause
-    exit /b 1
-)
-pushd "%LLAMA_DIR%"
-start "Embedding Server" llama-server.exe -m "{self.config['embedding_model']}" --embedding --pooling cls -ub 8192 -c 16000 --port {self.config['embedding_port']}
-popd
-endlocal
-exit"""
-                
-                try:
-                    with open(embedding_bat, 'w') as f:
-                        f.write(embedding_content)
-                    subprocess.run([str(embedding_bat)], shell=True, check=True)
-                    print(f"Embedding server started on port {self.config['embedding_port']}")
-                except Exception as e:
-                    print(f"Error starting embedding server: {e}")
-            
+                emb_lines = [
+                    "@echo off",
+                    "setlocal",
+                    'set "LLAMA_DIR=' + llama_dir + '"',
+                    'if "%LLAMA_DIR%"=="" (',
+                    "    echo ERROR: llama.cpp directory not configured.",
+                    "    pause",
+                    "    exit /b 1",
+                    ")",
+                    'pushd "%LLAMA_DIR%"',
+                    'start "Embedding Server" llama-server.exe'
+                    + ' -m "' + emb_model + '"'
+                    + " --embedding --pooling cls -ub 8192 -c 16000"
+                    + " --port " + emb_port
+                    + (" " + emb_flags_str if emb_flags_str.strip() else ""),
+                    "popd",
+                    "endlocal",
+                    "exit",
+                ]
+                content = "\r\n".join(emb_lines)
+                with open(embedding_bat, 'w', newline='') as f:
+                    f.write(content)
+                subprocess.run([str(embedding_bat)], shell=True, check=True)
+
             time.sleep(2)
             self.update_status()
-            # print(f"DEBUG: Final embedding server status: {self.embedding_server_running}")
-            
-        except subprocess.CalledProcessError as e:
-            print(f"Error toggling embedding server: {e}")
         except Exception as e:
-            print(f"Unexpected error toggling embedding server: {e}")
-    
+            print(f"Error toggling embedding server: {e}")
+
     def unload_model_internal(self):
-        """Internal method to unload model"""
         if not self.server_running:
-            print("Server is not running - cannot unload model")
             return
-        
         try:
-            print("Unloading model...")
             unload_url = f"http://localhost:{self.config['port']}/models/unload"
-            
             try:
                 response = requests.post(unload_url, json={}, timeout=0.5)
-                if response.status_code == 200:
-                    result = response.json()
-                    if result.get('success'):
-                        print("Model unloaded successfully")
-                        return
-            except:
+                if response.status_code == 200 and response.json().get('success'):
+                    print("Model unloaded successfully")
+                    return
+            except Exception:
                 pass
-            
+
             models_url = f"http://localhost:{self.config['port']}/models"
-            response = requests.get(models_url, timeout=0.5)
-            
+            response   = requests.get(models_url, timeout=0.5)
             if response.status_code == 200:
-                models_data = response.json()
-                
-                for model in models_data.get('data', []):
+                for model in response.json().get('data', []):
                     if model.get('status', {}).get('value') == 'loaded':
                         model_id = model['id']
-                        payload = {"model": model_id}
-                        unload_response = requests.post(unload_url, json=payload, timeout=0.5)
-                        
-                        if unload_response.status_code == 200:
-                            result = unload_response.json()
-                            if result.get('success'):
-                                print(f"Successfully unloaded model: {model_id}")
-                            else:
-                                print(f"Failed to unload model: {model_id}")
-                        else:
-                            print(f"Error unloading model: HTTP {unload_response.status_code}")
+                        r2 = requests.post(unload_url, json={"model": model_id}, timeout=0.5)
+                        print(f"Unloaded: {model_id}" if r2.status_code == 200
+                              else f"Failed to unload: {model_id}")
                         return
-                
-                print("No models are currently loaded")
-            else:
-                print(f"Error getting models list: HTTP {response.status_code}")
-                
-        except requests.exceptions.RequestException as e:
-            print(f"Network error while unloading model: {e}")
         except Exception as e:
             print(f"Error unloading model: {e}")
-    
+
     def unload_model(self, icon, item):
-        """Unload model using the server's /models/unload API endpoint"""
         self.unload_model_internal()
-    
+
     def open_webui(self, icon, item):
-        """Open the llama.cpp web UI in browser, starting server if needed"""
         if not self.server_running:
-            print("Server is not running - starting it first...")
             self.start_server_internal()
-            time.sleep(2)  # Give server time to start
-        
-        try:
-            webui_url = f"http://localhost:{self.config['port']}"
-            webbrowser.open(webui_url)
-            print(f"Opening web UI at {webui_url}")
-        except Exception as e:
-            print(f"Error opening web UI: {e}")
-    
+            time.sleep(2)
+        webbrowser.open(f"http://localhost:{self.config['port']}")
+
     def on_quit(self, icon, item):
-        """Quit the application"""
         if self.server_running:
             try:
-                print("Stopping server before quitting...")
-                subprocess.run(['taskkill', '/IM', 'llama-server.exe', '/T', '/F'], 
-                             shell=True, check=True)
+                subprocess.run(['taskkill', '/IM', 'llama-server.exe', '/T', '/F'],
+                               shell=True, check=True)
                 time.sleep(1)
-            except subprocess.CalledProcessError as e:
-                print(f"Error stopping server: {e}")
-        
+            except Exception:
+                pass
         self.running = False
         icon.stop()
-    
+
+    # ── click handling ───────────────────────────────────────────────────────
     def handle_double_click(self):
-        """Handle double-click on tray icon"""
-        print("\n=== DOUBLE CLICK DETECTED ===")
-        # Get fresh server status
         self.update_status()
-        print(f"Current server status: {'RUNNING' if self.server_running else 'STOPPED'}")
-        
         if not self.server_running:
-            # Server is off - start it
-            print("Action: Starting server...")
             self.start_server_internal()
         else:
-            # Server is on - unload model
-            print("Action: Unloading model...")
             self.unload_model_internal()
-        print("=== DOUBLE CLICK COMPLETE ===\n")
-    
+
     def process_click_timer(self):
-        """Process click after timer expires"""
         if self.click_count >= 2:
-            # Double click detected
             self.handle_double_click()
-        # Reset for next click
         self.click_count = 0
         self.click_timer = None
-    
+
     def on_left_click(self, icon, item):
-        """Handle left click - detect double-clicks using timer"""
         self.click_count += 1
-        
         if self.click_timer is not None:
-            # Cancel existing timer
             self.click_timer.cancel()
-        
-        # Start new timer
-        self.click_timer = threading.Timer(self.double_click_threshold, self.process_click_timer)
+        self.click_timer = threading.Timer(self.double_click_threshold,
+                                           self.process_click_timer)
         self.click_timer.start()
-    
+
+    # ── monitor thread ───────────────────────────────────────────────────────
     def monitor_server(self):
-        """Background thread to monitor server status"""
         while self.running:
             self.update_status()
             time.sleep(2)
-    
+
+    # ════════════════════════════════════════════════════════════════════════
+    #  MAIN RUN
+    # ════════════════════════════════════════════════════════════════════════
     def run(self):
-        """Start the system tray application"""
         self.running = True
-        
-        # Register signal handler for Ctrl+C
         signal.signal(signal.SIGINT, self.signal_handler)
-        
-        # Check if setup is required
+
         if self.check_setup_required():
             self.show_setup_wizard()
-        
-        # Create system tray
-        self.icon = pystray.Icon("llamacpp_server")
-        self.icon.icon = self.load_icon()
+
+        self.icon       = pystray.Icon("llamacpp_server")
+        self.icon.icon  = self.load_icon()
         self.icon.title = "Llama.cpp Server"
-        
-        # Set up menu - use the first "hidden" menu item as the default action
+
         self.icon.menu = pystray.Menu(
-            pystray.MenuItem("Double-Click Action", self.on_left_click, default=True, visible=False),
+            pystray.MenuItem("Double-Click Action", self.on_left_click,
+                             default=True, visible=False),
             pystray.MenuItem("Quit", self.on_quit),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Configuration", self.show_config),
-            pystray.MenuItem("Open Web UI", self.open_webui),
+            pystray.MenuItem("Configuration",          self.show_config),
+            pystray.MenuItem("Open Web UI",            self.open_webui),
             pystray.MenuItem("Start Embedding Server", self.toggle_embedding_server),
-            pystray.MenuItem("Stop Server", self.stop_server)
+            pystray.MenuItem("Stop Server",            self.stop_server),
         )
-        
-        # Start monitoring thread
+
         self.monitor_thread = threading.Thread(target=self.monitor_server, daemon=True)
         self.monitor_thread.start()
-        
-        # Initial status update
         self.update_status()
-        
-        print("Starting Llama.cpp System Tray Application...")
+
+        print("Starting Llama.cpp System Tray Application…")
         print("=" * 50)
-        print("DOUBLE-CLICK the tray icon to:")
-        print("  • Start server (if currently stopped)")
-        print("  • Unload model (if server is running)")
-        print("=" * 50)
+        print("DOUBLE-CLICK tray icon to start/stop server or unload model")
         print("Press Ctrl+C to quit")
-        
-        # Run system tray (blocks until quit)
+
         try:
             self.icon.run()
         except KeyboardInterrupt:
             self.signal_handler(signal.SIGINT, None)
-        
+
+
+# ── single-instance guard ────────────────────────────────────────────────────
 def is_already_running():
-    """Check if another instance of llamacpp_tray.py is already running"""
     try:
         current_pid = os.getpid()
-        
         for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
             try:
                 if proc.info['pid'] == current_pid:
                     continue
-                    
-                cmdline = proc.info.get('cmdline', [])
-                if cmdline:
-                    # Check if this is pythonw/python running our script
-                    exe_name = os.path.basename(cmdline[0]).lower()
-                    if exe_name in ['pythonw.exe', 'python.exe', 'pythonw', 'python']:
-                        cmdline_str = ' '.join(cmdline)
-                        if 'llamacpp_tray.py' in cmdline_str:
-                            return True
+                cmdline = proc.info.get('cmdline') or []
+                exe     = os.path.basename(cmdline[0]).lower() if cmdline else ""
+                if exe in ('pythonw.exe', 'python.exe', 'pythonw', 'python'):
+                    if 'llamacpp_tray.py' in ' '.join(cmdline):
+                        return True
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
-        return False
-    except:
-        return False
+    except Exception:
+        pass
+    return False
+
 
 if __name__ == "__main__":
-    # Check if already running
     if is_already_running():
         print("Llama.cpp Tray is already running!")
         sys.exit(0)
-    
+
     tray = LlamaCppTray()
     tray.run()
