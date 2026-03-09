@@ -113,6 +113,12 @@ class LlamaCppTray:
             "embedding_port": 8082,
             "embedding_flags": [],
             "flash_attn": False,
+            "preset_1_flags": [],
+            "preset_1_name": "Preset 1",
+            "preset_2_flags": [],
+            "preset_2_name": "Preset 2",
+            "preset_3_flags": [],
+            "preset_3_name": "Preset 3",
         }
         try:
             if self.config_file.exists():
@@ -343,7 +349,7 @@ class LlamaCppTray:
     # ════════════════════════════════════════════════════════════════════════
     def show_config(self, icon=None, item=None):
         root = ctk.CTk()
-        root.title("Llama.cpp — Configuration")
+        root.title("ToggleLlama")
         root.resizable(True, True)
         root.minsize(500, 700)
         root.configure(fg_color=BG_DARK)
@@ -445,34 +451,47 @@ class LlamaCppTray:
         lentry(scroll, "Server Port",  port_var,       width=100)
         lentry(scroll, "Max Models",   max_models_var, width=100)
 
-        fit_var       = ctk.BooleanVar(value=self.config.get("use_fit", False))
-        no_mmproj_var = ctk.BooleanVar(value=self.config.get("no_mmproj", False))
-        flash_attn_var = ctk.BooleanVar(value=self.config.get("flash_attn", False))
-        ctk_q8_var    = ctk.BooleanVar(value=self.config.get("ctk_q8", False))
-        ctv_q8_var    = ctk.BooleanVar(value=self.config.get("ctv_q8", False))
-        thinking_var  = ctk.StringVar(value=self.config.get("thinking", "off"))
-
+        fit_var         = ctk.BooleanVar(value=self.config.get("use_fit", False))
+        no_mmproj_var   = ctk.BooleanVar(value=self.config.get("no_mmproj", False))
+        flash_attn_var  = ctk.BooleanVar(value=self.config.get("flash_attn", False))
+        webui_mcp_var   = ctk.BooleanVar(value=self.config.get("use_webui_mcp_proxy", False))
+        no_mmap_var     = ctk.BooleanVar(value=self.config.get("use_no_mmap", False))
+        ctk_q8_var      = ctk.BooleanVar(value=self.config.get("ctk_q8", False))
+        ctv_q8_var      = ctk.BooleanVar(value=self.config.get("ctv_q8", False))
+        thinking_var    = ctk.StringVar(value=self.config.get("thinking", "off"))
+  
         toggles_frm = ctk.CTkFrame(scroll, fg_color="transparent")
         toggles_frm.pack(fill="x", padx=24, pady=3)
         ctk.CTkLabel(toggles_frm, text="Quick Flags", font=FONT_BODY,
                      text_color=TEXT, width=200, anchor="w").pack(side="left")
         ctk.CTkSwitch(toggles_frm, variable=fit_var, text="--fit",
-                      font=FONT_BODY, text_color=TEXT_DIM,
-                      button_color=ACCENT, progress_color=ACCENT2).pack(side="left", padx=(0, 24))
+                       font=FONT_BODY, text_color=TEXT_DIM,
+                       button_color=ACCENT, progress_color=ACCENT2).pack(side="left", padx=(0, 24))
         ctk.CTkSwitch(toggles_frm, variable=no_mmproj_var, text="--no-mmproj",
-                      font=FONT_BODY, text_color=TEXT_DIM,
-                      button_color=ACCENT, progress_color=ACCENT2).pack(side="left", padx=(0, 24))
+                       font=FONT_BODY, text_color=TEXT_DIM,
+                       button_color=ACCENT, progress_color=ACCENT2).pack(side="left", padx=(0, 24))
         ctk.CTkSwitch(toggles_frm, variable=flash_attn_var, text="--flash-attn on",
-                      font=FONT_BODY, text_color=TEXT_DIM,
-                      button_color=ACCENT, progress_color=ACCENT2).pack(side="left")
+                       font=FONT_BODY, text_color=TEXT_DIM,
+                       button_color=ACCENT, progress_color=ACCENT2).pack(side="left")
+
+        toggles_frm2 = ctk.CTkFrame(scroll, fg_color="transparent")
+        toggles_frm2.pack(fill="x", padx=24, pady=3)
+        ctk.CTkLabel(toggles_frm2, text="", font=FONT_BODY,
+                      text_color=TEXT, width=200, anchor="w").pack(side="left")
+        ctk.CTkSwitch(toggles_frm2, variable=no_mmap_var, text="--no-mmap",
+                        font=FONT_BODY, text_color=TEXT_DIM,
+                        button_color=ACCENT, progress_color=ACCENT2).pack(side="left", padx=(0, 24))
+        ctk.CTkSwitch(toggles_frm2, variable=webui_mcp_var, text="--webui-mcp-proxy",
+                        font=FONT_BODY, text_color=TEXT_DIM,
+                        button_color=ACCENT, progress_color=ACCENT2).pack(side="left")
 
         kv_frm = ctk.CTkFrame(scroll, fg_color="transparent")
         kv_frm.pack(fill="x", padx=24, pady=3)
         ctk.CTkLabel(kv_frm, text="KV Cache  (q8_0)", font=FONT_BODY,
                      text_color=TEXT, width=200, anchor="w").pack(side="left")
         ctk.CTkSwitch(kv_frm, variable=ctk_q8_var, text="-ctk q8_0",
-                      font=FONT_BODY, text_color=TEXT_DIM,
-                      button_color=ACCENT, progress_color=ACCENT2).pack(side="left", padx=(0, 24))
+                       font=FONT_BODY, text_color=TEXT_DIM,
+                       button_color=ACCENT, progress_color=ACCENT2).pack(side="left", padx=(0, 24))
         ctk.CTkSwitch(kv_frm, variable=ctv_q8_var, text="-ctv q8_0",
                       font=FONT_BODY, text_color=TEXT_DIM,
                       button_color=ACCENT, progress_color=ACCENT2).pack(side="left")
@@ -492,7 +511,7 @@ class LlamaCppTray:
                      font=FONT_SMALL, text_color=TEXT_DIM).pack(side="left", padx=(10, 0))
 
         _managed = {"--no-mmproj", "--fit", "--flash-attn", "-ctk", "-ctv", "q8_0", "on",
-                    "--chat-template-kwargs"}
+                     "--chat-template-kwargs", "--no-mmap", "--webui-mcp-proxy"}
         raw_flags   = self.config.get("flags", [])
         clean_flags = []
         skip_next   = False
@@ -510,6 +529,106 @@ class LlamaCppTray:
                placeholder="e.g. --gpu-layers 35 --threads 8")
         ctk.CTkLabel(scroll, text="",
                      font=FONT_SMALL, text_color=TEXT_DIM).pack(anchor="w", padx=24)
+
+        # ── SECTION: Flag Presets ────────────────────────────────────────────
+        _section_label(scroll, "Flag Presets")
+
+        def create_preset_row(preset_num, parent):
+            """Create a single preset row inside the given parent frame."""
+            flags_key   = f"preset_{preset_num}_flags"
+            name_key    = f"preset_{preset_num}_name"
+            preset_name = self.config.get(name_key, f"Preset {preset_num}")
+
+            preset_frame = ctk.CTkFrame(parent, fg_color=BG_MID)
+            preset_frame.pack(fill="x", pady=4)
+
+            name_var = ctk.StringVar(value=preset_name)
+            ctk.CTkEntry(preset_frame, textvariable=name_var, width=110, height=30,
+                         fg_color=BG_CARD, border_color=ACCENT2, text_color=TEXT,
+                         font=FONT_BODY).pack(side="left", padx=(6, 6))
+
+            def load_preset(n=preset_num, nv=name_var):
+                pflags_key   = f"preset_{n}_flags"
+                preset_flags = self.config.get(pflags_key, [])
+                self.config["context_window"]  = self.config.get(f"preset_{n}_context", 32000)
+                self.config["port"]            = self.config.get(f"preset_{n}_port", 8080)
+                self.config["max_models"]      = self.config.get(f"preset_{n}_max_models", 1)
+                self.config["flags"]           = preset_flags
+                self.config["use_fit"]         = "--fit" in preset_flags
+                self.config["no_mmproj"]       = "--no-mmproj" in preset_flags
+                self.config["flash_attn"]      = "--flash-attn" in preset_flags
+                self.config["use_no_mmap"]     = "--no-mmap" in preset_flags
+                self.config["use_webui_mcp_proxy"] = "--webui-mcp-proxy" in preset_flags
+                self.config["ctk_q8"]          = "-ctk" in preset_flags
+                self.config["ctv_q8"]          = "-ctv" in preset_flags
+                if "--chat-template-kwargs" in preset_flags:
+                    idx = preset_flags.index("--chat-template-kwargs")
+                    if idx + 1 < len(preset_flags):
+                        kwargs = preset_flags[idx + 1]
+                        self.config["thinking"] = "true" if '"enable_thinking": true' in kwargs else "false"
+                    else:
+                        self.config["thinking"] = "off"
+                else:
+                    self.config["thinking"] = "off"
+                self.save_config()
+                self.create_custom_batch()
+                root.destroy()
+                self.show_config()
+
+            def save_preset(n=preset_num, nv=name_var):
+                base_flags = flags_var.get().strip().split() if flags_var.get().strip() else []
+                if fit_var.get():
+                    base_flags += ["--fit", "on"]
+                if no_mmap_var.get():
+                    base_flags.append("--no-mmap")
+                if webui_mcp_var.get():
+                    base_flags.append("--webui-mcp-proxy")
+                if no_mmproj_var.get():
+                    base_flags.append("--no-mmproj")
+                if flash_attn_var.get():
+                    base_flags += ["--flash-attn", "on"]
+                if ctk_q8_var.get():
+                    base_flags += ["-ctk", "q8_0"]
+                if ctv_q8_var.get():
+                    base_flags += ["-ctv", "q8_0"]
+                if thinking_var.get() != "off":
+                    base_flags += ["--chat-template-kwargs",
+                                   '{"enable_thinking": ' + thinking_var.get() + '}']
+                self.config[f"preset_{n}_flags"]       = base_flags
+                self.config[f"preset_{n}_name"]        = nv.get()
+                self.config[f"preset_{n}_context"]     = ctx_var.get()
+                self.config[f"preset_{n}_port"]        = port_var.get()
+                self.config[f"preset_{n}_max_models"]  = max_models_var.get()
+                self.config["flags"]                   = base_flags
+                self.save_config()
+                self.create_custom_batch()
+
+            ctk.CTkButton(preset_frame, text="Load", width=52, height=30,
+                          fg_color=ACCENT, hover_color=ACCENT2,
+                          font=FONT_BODY,
+                          command=lambda p=preset_num: load_preset(p)).pack(side="left", padx=(0, 4))
+            ctk.CTkButton(preset_frame, text="Save", width=52, height=30,
+                          fg_color=SUCCESS, hover_color="#2fa882",
+                          font=FONT_BODY,
+                          command=lambda p=preset_num: save_preset(p)).pack(side="left", padx=(0, 4))
+
+        # ── 2-column grid: presets 1–3 left, 4–6 right ──────────────────────
+        presets_grid = ctk.CTkFrame(scroll, fg_color="transparent")
+        presets_grid.pack(fill="x", padx=24, pady=(2, 4))
+        presets_grid.columnconfigure(0, weight=1)
+        presets_grid.columnconfigure(1, weight=1)
+
+        left_col  = ctk.CTkFrame(presets_grid, fg_color="transparent")
+        right_col = ctk.CTkFrame(presets_grid, fg_color="transparent")
+        left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        right_col.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+
+        create_preset_row(1, left_col)
+        create_preset_row(2, left_col)
+        create_preset_row(3, left_col)
+        create_preset_row(4, right_col)
+        create_preset_row(5, right_col)
+        create_preset_row(6, right_col)
 
         # ── SECTION: Paths ──────────────────────────────────────────────────
         _section_label(scroll, "Paths")
@@ -548,6 +667,8 @@ class LlamaCppTray:
             self.config["models_dir"]      = models_dir_var.get()
             self.config["llamacpp_dir"]    = llamacpp_dir_var.get()
             self.config["use_fit"]         = fit_var.get()
+            self.config["use_no_mmap"]     = no_mmap_var.get()
+            self.config["use_webui_mcp_proxy"] = webui_mcp_var.get()
             self.config["no_mmproj"]       = no_mmproj_var.get()
             self.config["flash_attn"]      = flash_attn_var.get()
             self.config["ctk_q8"]          = ctk_q8_var.get()
@@ -557,6 +678,10 @@ class LlamaCppTray:
             self.config["embedding_port"]  = embedding_port_var.get()
 
             base_flags = flags_var.get().strip().split() if flags_var.get().strip() else []
+            if no_mmap_var.get():
+                base_flags.append("--no-mmap")
+            if webui_mcp_var.get():
+                base_flags.append("--webui-mcp-proxy")
             if fit_var.get():
                 base_flags += ["--fit", "on"]
             if no_mmproj_var.get():
@@ -567,7 +692,6 @@ class LlamaCppTray:
                 base_flags += ["-ctk", "q8_0"]
             if ctv_q8_var.get():
                 base_flags += ["-ctv", "q8_0"]
-            # ── FIX: store thinking kwargs as plain list items, no f-string ──
             if thinking_var.get() != "off":
                 base_flags += ["--chat-template-kwargs",
                                '{"enable_thinking": ' + thinking_var.get() + '}']
@@ -577,29 +701,18 @@ class LlamaCppTray:
             self.config["embedding_flags"] = emb.split() if emb else []
 
             if self.save_config():
-                messagebox.showinfo("Saved", "Configuration saved successfully!")
                 root.destroy()
             else:
                 feedback_var.set("⚠  Failed to save — check file permissions.")
 
-        def reset_defaults():
-            if messagebox.askyesno("Reset", "Reset all values to defaults?"):
-                ctx_var.set(32000)
-                ctx_lbl_var.set("Context: 32,000")
-                port_var.set(8080)
-                max_models_var.set(1)
-                models_dir_var.set("")
-                llamacpp_dir_var.set("")
-                fit_var.set(False)
-                no_mmproj_var.set(False)
-                flash_attn_var.set(False)
-                ctk_q8_var.set(False)
-                ctv_q8_var.set(False)
-                thinking_var.set("off")
-                flags_var.set("")
-                embedding_model_var.set("")
-                embedding_port_var.set(8082)
-                embedding_flags_var.set("")
+        def toggle_server_switch(is_on):
+            import threading
+            def run_toggle():
+                if is_on:
+                    self.start_server(None, None)
+                else:
+                    self.stop_server(None, None)
+            threading.Thread(target=run_toggle, daemon=True).start()
 
         ctk.CTkButton(btn_frm, text="Save", width=110, height=38,
                       fg_color=SUCCESS, hover_color="#2fa882",
@@ -609,10 +722,9 @@ class LlamaCppTray:
                       fg_color=BG_CARD, hover_color=BG_MID,
                       font=FONT_BODY, command=root.destroy).pack(
             side="left", padx=6, pady=11)
-        ctk.CTkButton(btn_frm, text="Reset Defaults", width=120, height=38,
-                      fg_color=DANGER, hover_color="#c04040",
-                      font=FONT_BODY, command=reset_defaults).pack(
-            side="right", padx=20, pady=11)
+        server_switch = ctk.CTkSwitch(btn_frm, text="Server",
+                                      command=lambda: toggle_server_switch(server_switch.get()))
+        server_switch.pack(side="right", padx=20, pady=11)
 
         root.mainloop()
 
@@ -629,18 +741,14 @@ class LlamaCppTray:
         else:
             context_param = "-c " + str(self.config["context_window"])
 
-        # Build the flags string — replace any bare { } from the
-        # --chat-template-kwargs value with CMD-safe escaped versions.
         safe_flags_parts = []
         flags = self.config.get("flags", [])
         i = 0
         while i < len(flags):
             flag = flags[i]
             if flag == "--chat-template-kwargs" and i + 1 < len(flags):
-                # The JSON value must have its quotes escaped for CMD
                 json_val = flags[i + 1]
-                # Wrap in double-quotes, escape inner double-quotes as \"
-                escaped = '"' + json_val.replace('"', '\\"') + '"'
+                escaped  = '"' + json_val.replace('"', '\\"') + '"'
                 safe_flags_parts.append("--chat-template-kwargs")
                 safe_flags_parts.append(escaped)
                 i += 2
@@ -648,14 +756,12 @@ class LlamaCppTray:
                 safe_flags_parts.append(flag)
                 i += 1
 
-        flags_str = " ".join(safe_flags_parts)
+        flags_str  = " ".join(safe_flags_parts)
+        llama_dir  = self.config.get("llamacpp_dir", "")
+        models_dir = self.config["models_dir"]
+        port       = str(self.config["port"])
+        max_models = str(self.config.get("max_models", 1))
 
-        llama_dir   = self.config.get("llamacpp_dir", "")
-        models_dir  = self.config["models_dir"]
-        port        = str(self.config["port"])
-        max_models  = str(self.config.get("max_models", 1))
-
-        # Build bat using plain concatenation — zero f-strings touching user data
         lines = [
             "@echo off",
             "setlocal",
@@ -784,11 +890,11 @@ class LlamaCppTray:
                     print("ERROR: Llama.cpp dir or embedding model not configured.")
                     return
 
-                embedding_bat   = Path(__file__).parent / "server_embedding.bat"
-                emb_flags_str   = " ".join(self.config.get("embedding_flags", []))
-                emb_model       = self.config["embedding_model"]
-                emb_port        = str(self.config["embedding_port"])
-                llama_dir       = self.config.get("llamacpp_dir", "")
+                embedding_bat = Path(__file__).parent / "server_embedding.bat"
+                emb_flags_str = " ".join(self.config.get("embedding_flags", []))
+                emb_model     = self.config["embedding_model"]
+                emb_port      = str(self.config["embedding_port"])
+                llama_dir     = self.config.get("llamacpp_dir", "")
 
                 emb_lines = [
                     "@echo off",
