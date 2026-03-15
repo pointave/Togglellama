@@ -119,6 +119,12 @@ class LlamaCppTray:
             "preset_2_name": "Preset 2",
             "preset_3_flags": [],
             "preset_3_name": "Preset 3",
+            "preset_4_flags": [],
+            "preset_4_name": "Preset 4",
+            "preset_5_flags": [],
+            "preset_5_name": "Preset 5",
+            "preset_6_flags": [],
+            "preset_6_name": "Preset 6",
         }
         try:
             if self.config_file.exists():
@@ -510,24 +516,46 @@ class LlamaCppTray:
         ctk.CTkLabel(think_frm, text="   off = don't pass flag,  true/false = explicit",
                      font=FONT_SMALL, text_color=TEXT_DIM).pack(side="left", padx=(10, 0))
 
-        _managed = {"--no-mmproj", "--fit", "--flash-attn", "-ctk", "-ctv", "q8_0", "on",
-                     "--chat-template-kwargs", "--no-mmap", "--webui-mcp-proxy"}
+        # Strip only the flags that are exclusively owned by the UI toggles.
+        # Rules:
+        #   - Simple toggle flags (no value): always remove.
+        #   - --fit / --flash-attn: always remove (value is always "on").
+        #   - --chat-template-kwargs: always remove (value is JSON from Thinking toggle).
+        #   - -ctk / -ctv: ONLY remove when the next token is "q8_0" (the toggle value).
+        #     When the user has typed e.g. "-ctk bf16", those tokens are NOT owned by
+        #     the toggle and must be kept in the Additional Flags field.
+        _toggle_flags_no_value = {"--no-mmproj", "--no-mmap", "--webui-mcp-proxy"}
+        _toggle_flags_always_with_value = {"--fit", "--flash-attn", "--chat-template-kwargs"}
+        _toggle_flags_q8_only = {"-ctk", "-ctv"}   # only strip when value == "q8_0"
+
         raw_flags   = self.config.get("flags", [])
         clean_flags = []
-        skip_next   = False
-        for f in raw_flags:
-            if skip_next:
-                skip_next = False
-                continue
-            if f == "--chat-template-kwargs":
-                skip_next = True
-                continue
-            if f not in _managed:
+        i = 0
+        while i < len(raw_flags):
+            f = raw_flags[i]
+            if f in _toggle_flags_no_value:
+                i += 1  # skip flag only
+            elif f in _toggle_flags_always_with_value:
+                i += 2  # skip flag + its value
+            elif f in _toggle_flags_q8_only:
+                next_val = raw_flags[i + 1] if i + 1 < len(raw_flags) else ""
+                if next_val == "q8_0":
+                    i += 2  # toggle-owned — skip both
+                else:
+                    # User-typed custom value (e.g. bf16) — keep both tokens
+                    clean_flags.append(f)
+                    if next_val:
+                        clean_flags.append(next_val)
+                    i += 2
+            else:
                 clean_flags.append(f)
+                i += 1
+
         flags_var = ctk.StringVar(value=" ".join(clean_flags))
         lentry(scroll, "Additional Flags", flags_var,
-               placeholder="e.g. --gpu-layers 35 --threads 8")
-        ctk.CTkLabel(scroll, text="",
+               placeholder="e.g. --gpu-layers 35 -ctk bf16 -ctv bf16")
+        ctk.CTkLabel(scroll, text="   Use this for any flags not covered by the toggles above "
+                                  "(e.g. -ctk bf16, --gpu-layers 35)",
                      font=FONT_SMALL, text_color=TEXT_DIM).pack(anchor="w", padx=24)
 
         # ── SECTION: Flag Presets ────────────────────────────────────────────
@@ -559,8 +587,10 @@ class LlamaCppTray:
                 self.config["flash_attn"]      = "--flash-attn" in preset_flags
                 self.config["use_no_mmap"]     = "--no-mmap" in preset_flags
                 self.config["use_webui_mcp_proxy"] = "--webui-mcp-proxy" in preset_flags
-                self.config["ctk_q8"]          = "-ctk" in preset_flags
-                self.config["ctv_q8"]          = "-ctv" in preset_flags
+                self.config["ctk_q8"]          = ("-ctk" in preset_flags and
+                                                   _preset_kv_value(preset_flags, "-ctk") == "q8_0")
+                self.config["ctv_q8"]          = ("-ctv" in preset_flags and
+                                                   _preset_kv_value(preset_flags, "-ctv") == "q8_0")
                 if "--chat-template-kwargs" in preset_flags:
                     idx = preset_flags.index("--chat-template-kwargs")
                     if idx + 1 < len(preset_flags):
@@ -728,10 +758,17 @@ class LlamaCppTray:
 
         root.mainloop()
 
+    # ── helper: get the value token after a flag in a list ──────────────────
+    @staticmethod
+    def _preset_kv_value(flags, flag_name):
+        try:
+            idx = flags.index(flag_name)
+            return flags[idx + 1] if idx + 1 < len(flags) else ""
+        except ValueError:
+            return ""
+
     # ════════════════════════════════════════════════════════════════════════
     #  BATCH FILE GENERATION
-    #  Key rule: never use f-strings for the batch file body — cmd.exe eats
-    #  bare { } characters.  Build every line with plain string concatenation.
     # ════════════════════════════════════════════════════════════════════════
     def create_custom_batch(self):
         custom_bat = Path(__file__).parent / "server_llamacpp.bat"
@@ -804,6 +841,62 @@ class LlamaCppTray:
             return custom_bat
         except Exception:
             return self.bat_file
+
+    # ════════════════════════════════════════════════════════════════════════
+    #  PRESET ACTIONS (called from tray menu)
+    # ════════════════════════════════════════════════════════════════════════
+    def _apply_preset(self, preset_num):
+        """Load a preset, rebuild the batch, optionally restart the server."""
+        flags_key    = f"preset_{preset_num}_flags"
+        preset_flags = self.config.get(flags_key, [])
+
+        if not preset_flags:
+            print(f"Preset {preset_num} has no flags saved — open Configuration to save it first.")
+            return
+
+        self.config["context_window"]      = self.config.get(f"preset_{preset_num}_context", 32000)
+        self.config["port"]                = self.config.get(f"preset_{preset_num}_port", 8080)
+        self.config["max_models"]          = self.config.get(f"preset_{preset_num}_max_models", 1)
+        self.config["flags"]               = preset_flags
+        self.config["use_fit"]             = "--fit" in preset_flags
+        self.config["no_mmproj"]           = "--no-mmproj" in preset_flags
+        self.config["flash_attn"]          = "--flash-attn" in preset_flags
+        self.config["use_no_mmap"]         = "--no-mmap" in preset_flags
+        self.config["use_webui_mcp_proxy"] = "--webui-mcp-proxy" in preset_flags
+        self.config["ctk_q8"]              = (
+            "-ctk" in preset_flags and
+            self._preset_kv_value(preset_flags, "-ctk") == "q8_0"
+        )
+        self.config["ctv_q8"]              = (
+            "-ctv" in preset_flags and
+            self._preset_kv_value(preset_flags, "-ctv") == "q8_0"
+        )
+        if "--chat-template-kwargs" in preset_flags:
+            idx = preset_flags.index("--chat-template-kwargs")
+            if idx + 1 < len(preset_flags):
+                kwargs = preset_flags[idx + 1]
+                self.config["thinking"] = "true" if '"enable_thinking": true' in kwargs else "false"
+            else:
+                self.config["thinking"] = "off"
+        else:
+            self.config["thinking"] = "off"
+
+        self.save_config()
+        self.create_custom_batch()
+        print(f"Preset {preset_num} applied.")
+
+        # If server is running, restart it with the new flags
+        if self.server_running:
+            print("Restarting server with new preset…")
+            self.stop_server(None, None)
+            time.sleep(1)
+            self.start_server_internal()
+
+    def _make_preset_action(self, n):
+        """Return a callable suitable for pystray that applies preset n."""
+        def action(icon, item):
+            threading.Thread(target=self._apply_preset, args=(n,), daemon=True).start()
+        return action
 
     # ════════════════════════════════════════════════════════════════════════
     #  Server control
@@ -999,6 +1092,31 @@ class LlamaCppTray:
             self.update_status()
             time.sleep(2)
 
+    # ── build tray menu (called at startup and after config changes) ─────────
+    def _build_menu(self):
+        """Build the pystray Menu, pulling live preset names from config."""
+        preset_items = []
+        for n in range(1, 7):
+            name = self.config.get(f"preset_{n}_name", f"Preset {n}").strip() or f"Preset {n}"
+            has_flags = bool(self.config.get(f"preset_{n}_flags"))
+            label = name if has_flags else f"{name} (empty)"
+            preset_items.append(
+                pystray.MenuItem(label, self._make_preset_action(n))
+            )
+
+        return pystray.Menu(
+            pystray.MenuItem("Double-Click Action", self.on_left_click,
+                             default=True, visible=False),
+            pystray.MenuItem("Presets", pystray.Menu(*preset_items)),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Configuration",          self.show_config),
+            pystray.MenuItem("Open Web UI",            self.open_webui),
+            pystray.MenuItem("Start Embedding Server", self.toggle_embedding_server),
+            pystray.MenuItem("Stop Server",            self.stop_server),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit", self.on_quit),
+        )
+
     # ════════════════════════════════════════════════════════════════════════
     #  MAIN RUN
     # ════════════════════════════════════════════════════════════════════════
@@ -1012,17 +1130,7 @@ class LlamaCppTray:
         self.icon       = pystray.Icon("llamacpp_server")
         self.icon.icon  = self.load_icon()
         self.icon.title = "Llama.cpp Server"
-
-        self.icon.menu = pystray.Menu(
-            pystray.MenuItem("Double-Click Action", self.on_left_click,
-                             default=True, visible=False),
-            pystray.MenuItem("Quit", self.on_quit),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Configuration",          self.show_config),
-            pystray.MenuItem("Open Web UI",            self.open_webui),
-            pystray.MenuItem("Start Embedding Server", self.toggle_embedding_server),
-            pystray.MenuItem("Stop Server",            self.stop_server),
-        )
+        self.icon.menu  = self._build_menu()
 
         self.monitor_thread = threading.Thread(target=self.monitor_server, daemon=True)
         self.monitor_thread.start()
@@ -1057,6 +1165,15 @@ def is_already_running():
     except Exception:
         pass
     return False
+
+
+# ── module-level helper (also used inside show_config via self.) ─────────────
+def _preset_kv_value(flags, flag_name):
+    try:
+        idx = flags.index(flag_name)
+        return flags[idx + 1] if idx + 1 < len(flags) else ""
+    except ValueError:
+        return ""
 
 
 if __name__ == "__main__":
