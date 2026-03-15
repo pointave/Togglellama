@@ -731,6 +731,7 @@ class LlamaCppTray:
             self.config["embedding_flags"] = emb.split() if emb else []
 
             if self.save_config():
+                self.create_custom_batch()
                 root.destroy()
             else:
                 feedback_var.set("⚠  Failed to save — check file permissions.")
@@ -1092,6 +1093,26 @@ class LlamaCppTray:
             self.update_status()
             time.sleep(2)
 
+    # ── mmproj toggle ────────────────────────────────────────────────────────
+    def toggle_mmproj(self, icon, item):
+        """Flip the --no-mmproj flag, save config, rebuild batch."""
+        current = self.config.get("no_mmproj", False)
+        self.config["no_mmproj"] = not current
+
+        # Keep the flags list consistent with the new toggle state
+        flags = self.config.get("flags", [])
+        if self.config["no_mmproj"]:
+            if "--no-mmproj" not in flags:
+                flags.append("--no-mmproj")
+        else:
+            flags = [f for f in flags if f != "--no-mmproj"]
+        self.config["flags"] = flags
+
+        self.save_config()
+        self.create_custom_batch()
+        state = "ON (--no-mmproj active)" if self.config["no_mmproj"] else "OFF"
+        print(f"mmproj toggled: {state}")
+
     # ── build tray menu (called at startup and after config changes) ─────────
     def _build_menu(self):
         """Build the pystray Menu, pulling live preset names from config."""
@@ -1112,6 +1133,8 @@ class LlamaCppTray:
             pystray.MenuItem("Configuration",          self.show_config),
             pystray.MenuItem("Open Web UI",            self.open_webui),
             pystray.MenuItem("Start Embedding Server", self.toggle_embedding_server),
+            pystray.MenuItem("Disable Vision", self.toggle_mmproj,
+                             checked=lambda item: self.config.get("no_mmproj", False)),
             pystray.MenuItem("Stop Server",            self.stop_server),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self.on_quit),
