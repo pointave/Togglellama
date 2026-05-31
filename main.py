@@ -1,5 +1,7 @@
+import os
 import pystray
 from PIL import Image, ImageDraw
+
 import subprocess
 import time
 import threading
@@ -11,7 +13,6 @@ import customtkinter as ctk
 import requests
 import webbrowser
 import sys
-import os
 import psutil
 import signal
 
@@ -30,20 +31,73 @@ def _make_window_foreground(win: ctk.CTk | ctk.CTkToplevel):
 
 # ── Reusable styled widgets ──────────────────────────────────────────────────
 
-ACCENT   = "#4f8ef7"
-ACCENT2  = "#2d6fd4"
 BG_DARK  = "#1a1a2e"
 BG_MID   = "#16213e"
-BG_CARD  = "#0f3460"
 TEXT     = "#e0e0e0"
 TEXT_DIM = "#8a8aaa"
 SUCCESS  = "#43c59e"
 DANGER   = "#e05c5c"
 
+
+def _derive_theme(hex_color: str):
+    """Derive GUI theme colours from a single accent hex colour.
+
+    Returns dict with keys: ACCENT, ACCENT2, BG_CARD
+    ACCENT  = the chosen colour
+    ACCENT2 = a darker shade for borders / hover states
+    BG_CARD = a tinted dark card background derived from the accent
+    """
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+    # darker shade (multiply each channel by ~0.65)
+    accent2 = f"#{int(r*0.65):02x}{int(g*0.65):02x}{int(b*0.65):02x}"
+
+    # bg_card: a very dark tint of the accent (~12 % brightness)
+    card = f"#{int(r*0.18+15):02x}{int(g*0.18+15):02x}{int(b*0.18+20):02x}"
+
+    return {"ACCENT": hex_color, "ACCENT2": accent2, "BG_CARD": card}
+
+
+# Default theme (Blue)
+_THEME = _derive_theme("#4f8ef7")
+ACCENT   = _THEME["ACCENT"]
+ACCENT2  = _THEME["ACCENT2"]
+BG_CARD  = _THEME["BG_CARD"]
+
+
+def get_theme(hex_color: str):
+    """Return the full theme dict for the given accent colour."""
+    return _derive_theme(hex_color) if hex_color else _THEME
+
+
+def apply_theme(hex_color: str):
+    """Update the module-level colour constants so all subsequently created
+    widgets use the new theme.  Must be called before showing a window."""
+    global ACCENT, ACCENT2, BG_CARD
+    t = _derive_theme(hex_color)
+    ACCENT  = t["ACCENT"]
+    ACCENT2 = t["ACCENT2"]
+    BG_CARD = t["BG_CARD"]
+
 FONT_TITLE  = ("Segoe UI", 18, "bold")
 FONT_HEADER = ("Segoe UI", 12, "bold")
 FONT_BODY   = ("Segoe UI", 11)
 FONT_SMALL  = ("Segoe UI", 9)
+
+# ── 10 icon overlay colours the user can cycle through ──────────────────────
+ICON_COLORS = [
+    ("#4f8ef7", "Blue"),
+    ("#43c59e", "Teal"),
+    ("#e05c5c", "Red"),
+    ("#e0a85c", "Orange"),
+    ("#c55ce0", "Purple"),
+    ("#5ce06e", "Green"),
+    ("#e0e05c", "Yellow"),
+    ("#5ccfe0", "Cyan"),
+    ("#e05ca8", "Pink"),
+    ("#ffffff", "White"),
+]
 
 
 def _section_label(parent, text):
@@ -105,14 +159,16 @@ class LlamaCppTray:
             "no_mmproj": False,
             "ctk_q8": False,
             "ctv_q8": False,
-            "thinking": "off",
+            "thinking": False,
             "max_models": 1,
+            "spec_draft_n_max": 0,
             "flags": [],
             "theme": "dark",
             "embedding_model": "",
             "embedding_port": 8082,
             "embedding_flags": [],
             "flash_attn": False,
+            "icon_color_index": 0,          # index into ICON_COLORS (GUI theme)
             "preset_1_flags": [],
             "preset_1_name": "Preset 1",
             "preset_2_flags": [],
@@ -125,6 +181,10 @@ class LlamaCppTray:
             "preset_5_name": "Preset 5",
             "preset_6_flags": [],
             "preset_6_name": "Preset 6",
+            "preset_7_flags": [],
+            "preset_7_name": "Preset 7",
+            "preset_8_flags": [],
+            "preset_8_name": "Preset 8",
         }
         try:
             if self.config_file.exists():
@@ -136,6 +196,17 @@ class LlamaCppTray:
         except Exception:
             self.config = defaults
 
+        # normalize legacy thinking value (string → bool)
+        thinking = self.config.get("thinking")
+        if thinking in ("on", "true", True):
+            self.config["thinking"] = True
+        else:
+            self.config["thinking"] = False
+
+        # clamp color index
+        idx = self.config.get("icon_color_index", 0)
+        self.config["icon_color_index"] = max(0, min(idx, len(ICON_COLORS) - 1))
+
     def save_config(self):
         try:
             with open(self.config_file, 'w') as f:
@@ -143,6 +214,13 @@ class LlamaCppTray:
             return True
         except Exception:
             return False
+
+    # ── icon helpers ────────────────────────────────────────────────────────
+    def _hex_to_rgba(self, hex_color, alpha=160):
+        """Convert '#rrggbb' to (r, g, b, a)."""
+        h = hex_color.lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return (r, g, b, alpha)
 
     # ── server checks ───────────────────────────────────────────────────────
     def check_server_status(self):
@@ -177,10 +255,10 @@ class LlamaCppTray:
 
     def update_icon(self):
         if self.server_running:
-            self.icon.icon  = self.load_icon(color='green')
+            self.icon.icon  = self.load_icon(running=True)
             self.icon.title = "Llama.cpp - Running"
         else:
-            self.icon.icon  = self.load_icon(color='red')
+            self.icon.icon  = self.load_icon(running=False)
             self.icon.title = "Llama.cpp - Stopped"
 
     # ── icon helpers ────────────────────────────────────────────────────────
@@ -190,18 +268,27 @@ class LlamaCppTray:
         dc.rectangle([16, 16, 48, 48], fill='white')
         return image
 
-    def load_icon(self, color='red'):
+    def load_icon(self, running=None, color=None):
+        """Build the tray icon image — red tint overlay when server is not running."""
+        # legacy compat for callers that pass `color='green'`
+        if color is not None and running is None:
+            running = (color == 'green')
+
         icon_path = Path(__file__).parent / "llamacpp_tray.ico"
         if icon_path.exists() and icon_path.stat().st_size > 0:
             try:
                 base = Image.open(icon_path).convert('RGBA')
-                if color == 'red':
+                if not running:
+                    # red tint overlay when server is stopped
                     overlay = Image.new('RGBA', base.size, (255, 0, 0, 50))
                     return Image.alpha_composite(base, overlay)
                 return base
             except Exception:
                 pass
-        return self.create_image(color)
+
+        # fallback: red square when stopped, white when running
+        fallback_color = 'red' if not running else 'white'
+        return self.create_image(color=fallback_color)
 
     # ── setup check ─────────────────────────────────────────────────────────
     def check_setup_required(self):
@@ -214,6 +301,9 @@ class LlamaCppTray:
     #  SETUP WIZARD
     # ════════════════════════════════════════════════════════════════════════
     def show_setup_wizard(self):
+        chosen_hex = ICON_COLORS[self.config.get("icon_color_index", 0)][0]
+        apply_theme(chosen_hex)
+
         root = ctk.CTk()
         root.title("Llama.cpp Tray — First-Time Setup")
         root.geometry("560x720")
@@ -343,7 +433,7 @@ class LlamaCppTray:
 
         ctk.CTkButton(btn_row, text="Save & Continue", width=160, height=40,
                       fg_color=SUCCESS, hover_color="#2fa882",
-                      font=FONT_HEADER, command=save_setup).pack(side="left", padx=8)
+                      text_color="#1a1a2e", font=FONT_HEADER, command=save_setup).pack(side="left", padx=8)
         ctk.CTkButton(btn_row, text="Skip", width=80, height=40,
                       fg_color=BG_CARD, hover_color=BG_MID,
                       font=FONT_BODY, command=skip_setup).pack(side="left", padx=8)
@@ -354,6 +444,10 @@ class LlamaCppTray:
     #  CONFIGURATION WINDOW
     # ════════════════════════════════════════════════════════════════════════
     def show_config(self, icon=None, item=None):
+        # Apply the user's chosen theme colour before creating widgets
+        chosen_hex = ICON_COLORS[self.config.get("icon_color_index", 0)][0]
+        apply_theme(chosen_hex)
+
         root = ctk.CTk()
         root.title("ToggleLlama")
         root.resizable(True, True)
@@ -454,8 +548,44 @@ class LlamaCppTray:
 
         port_var       = ctk.IntVar(value=self.config["port"])
         max_models_var = ctk.IntVar(value=self.config.get("max_models", 1))
+        mtp_var        = ctk.IntVar(value=self.config.get("spec_draft_n_max", 0))
         lentry(scroll, "Server Port",  port_var,       width=100)
-        lentry(scroll, "Max Models",   max_models_var, width=100)
+
+        # Max Models + MTP on one row
+        mtp_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        mtp_row.pack(fill="x", padx=24, pady=3)
+        ctk.CTkLabel(mtp_row, text="Max Models", font=FONT_BODY,
+                     text_color=TEXT, width=200, anchor="w").pack(side="left")
+        ctk.CTkEntry(mtp_row, textvariable=max_models_var, width=60, height=34,
+                     fg_color=BG_MID, border_color=ACCENT2,
+                     text_color=TEXT, font=FONT_BODY).pack(side="left", padx=(0, 12))
+        ctk.CTkLabel(mtp_row, text="MTP", font=FONT_BODY,
+                     text_color=TEXT, width=40, anchor="w").pack(side="left")
+        mtp_spin = ctk.CTkEntry(mtp_row, textvariable=mtp_var, width=70, height=34,
+                                fg_color=BG_MID, border_color=ACCENT2,
+                                text_color=TEXT, font=FONT_BODY, justify="center")
+        mtp_spin.pack(side="left")
+
+        def _mtp_wheel(event):
+            val = mtp_var.get()
+            if event.delta < 0 and val < 6:
+                mtp_var.set(val + 1)
+            elif event.delta > 0 and val > 0:
+                mtp_var.set(val - 1)
+            return "break"
+        def _mtp_key(event):
+            val = mtp_var.get()
+            if event.keysym == "Up" and val < 6:
+                mtp_var.set(val + 1)
+                return "break"
+            elif event.keysym == "Down" and val > 0:
+                mtp_var.set(val - 1)
+                return "break"
+        mtp_spin.bind("<MouseWheel>", _mtp_wheel)
+        mtp_spin.bind("<Key>", _mtp_key)
+        mtp_lbl = ctk.CTkLabel(mtp_row, text="", width=8, fg_color="transparent")
+        mtp_lbl.pack(side="left")
+        mtp_lbl.bind("<MouseWheel>", _mtp_wheel)
 
         fit_var         = ctk.BooleanVar(value=self.config.get("use_fit", False))
         no_mmproj_var   = ctk.BooleanVar(value=self.config.get("no_mmproj", False))
@@ -464,8 +594,8 @@ class LlamaCppTray:
         no_mmap_var     = ctk.BooleanVar(value=self.config.get("use_no_mmap", False))
         ctk_q8_var      = ctk.BooleanVar(value=self.config.get("ctk_q8", False))
         ctv_q8_var      = ctk.BooleanVar(value=self.config.get("ctv_q8", False))
-        thinking_var    = ctk.StringVar(value=self.config.get("thinking", "off"))
-  
+        thinking_var    = ctk.BooleanVar(value=self.config.get("thinking", False))
+
         toggles_frm = ctk.CTkFrame(scroll, fg_color="transparent")
         toggles_frm.pack(fill="x", padx=24, pady=3)
         ctk.CTkLabel(toggles_frm, text="Quick Flags", font=FONT_BODY,
@@ -501,32 +631,74 @@ class LlamaCppTray:
         ctk.CTkSwitch(kv_frm, variable=ctv_q8_var, text="-ctv q8_0",
                       font=FONT_BODY, text_color=TEXT_DIM,
                       button_color=ACCENT, progress_color=ACCENT2).pack(side="left")
-        ctk.CTkLabel(kv_frm, text="",
-                     font=FONT_SMALL, text_color=TEXT_DIM).pack(side="left", padx=(12, 0))
 
         think_frm = ctk.CTkFrame(scroll, fg_color="transparent")
         think_frm.pack(fill="x", padx=24, pady=3)
         ctk.CTkLabel(think_frm, text="Thinking Mode", font=FONT_BODY,
                      text_color=TEXT, width=200, anchor="w").pack(side="left")
-        ctk.CTkSegmentedButton(think_frm, values=["off", "true", "false"],
-                               variable=thinking_var, font=FONT_BODY,
-                               selected_color=ACCENT, selected_hover_color=ACCENT2,
-                               unselected_color=BG_CARD, unselected_hover_color=BG_MID,
-                               text_color=TEXT).pack(side="left")
-        ctk.CTkLabel(think_frm, text="   off = don't pass flag,  true/false = explicit",
-                     font=FONT_SMALL, text_color=TEXT_DIM).pack(side="left", padx=(10, 0))
+        ctk.CTkSwitch(think_frm, variable=thinking_var, text="--reasoning on",
+                      font=FONT_BODY, text_color=TEXT_DIM,
+                      button_color=ACCENT, progress_color=ACCENT2).pack(side="left")
 
-        # Strip only the flags that are exclusively owned by the UI toggles.
-        # Rules:
-        #   - Simple toggle flags (no value): always remove.
-        #   - --fit / --flash-attn: always remove (value is always "on").
-        #   - --chat-template-kwargs: always remove (value is JSON from Thinking toggle).
-        #   - -ctk / -ctv: ONLY remove when the next token is "q8_0" (the toggle value).
-        #     When the user has typed e.g. "-ctk bf16", those tokens are NOT owned by
-        #     the toggle and must be kept in the Additional Flags field.
-        _toggle_flags_no_value = {"--no-mmproj", "--no-mmap", "--webui-mcp-proxy"}
-        _toggle_flags_always_with_value = {"--fit", "--flash-attn", "--chat-template-kwargs"}
-        _toggle_flags_q8_only = {"-ctk", "-ctv"}   # only strip when value == "q8_0"
+        # ── SECTION: Theme Colour ────────────────────────────────────────────
+        _section_label(scroll, "Theme Colour")
+
+        color_idx_var = ctk.IntVar(value=self.config.get("icon_color_index", 0))
+        swatch_buttons = []
+
+        color_name_var = ctk.StringVar(
+            value=ICON_COLORS[color_idx_var.get()][1])
+
+        def _apply_and_select(idx):
+            """Select a colour, update the live theme globals, and refresh the window."""
+            color_idx_var.set(idx)
+            hex_col = ICON_COLORS[idx][0]
+            color_name_var.set(ICON_COLORS[idx][1])
+            for i, btn in enumerate(swatch_buttons):
+                border = "#ffffff" if i == idx else "#333355"
+                btn.configure(border_color=border, border_width=2 if i == idx else 1)
+            # Apply theme live by restarting the config window
+            self.config["icon_color_index"] = idx
+            self.save_config()
+            root.destroy()
+            self.show_config()
+
+        for idx, btn in enumerate(swatch_buttons):
+            btn.configure(command=lambda i=idx: _apply_and_select(i))
+
+        color_frm = ctk.CTkFrame(scroll, fg_color="transparent")
+        color_frm.pack(fill="x", padx=24, pady=(4, 8))
+        ctk.CTkLabel(color_frm, text="GUI theme colour", font=FONT_BODY,
+                     text_color=TEXT, width=200, anchor="w").pack(side="left")
+
+        swatch_frm = ctk.CTkFrame(color_frm, fg_color="transparent")
+        swatch_frm.pack(side="left")
+
+        for idx, (hex_col, name) in enumerate(ICON_COLORS):
+            btn = ctk.CTkButton(
+                swatch_frm,
+                text="",
+                width=28,
+                height=28,
+                corner_radius=14,
+                fg_color=hex_col,
+                hover_color=hex_col,
+                border_color="#ffffff" if idx == color_idx_var.get() else "#333355",
+                border_width=2 if idx == color_idx_var.get() else 1,
+                command=lambda i=idx: _apply_and_select(i),
+            )
+            btn.pack(side="left", padx=3)
+            swatch_buttons.append(btn)
+
+        ctk.CTkLabel(color_frm, textvariable=color_name_var,
+                     font=FONT_SMALL, text_color=TEXT_DIM,
+                     width=60).pack(side="left", padx=(10, 0))
+
+        # ── strip toggle-owned flags ─────────────────────────────────────────
+        _toggle_flags_no_value        = {"--no-mmproj", "--no-mmap", "--webui-mcp-proxy"}
+        _toggle_flags_always_with_value = {"--fit", "--flash-attn", "--reasoning",
+                                           "--spec-type", "--spec-draft-n-max", "-spec-type"}
+        _toggle_flags_q8_only         = {"-ctk", "-ctv"}
 
         raw_flags   = self.config.get("flags", [])
         clean_flags = []
@@ -534,15 +706,14 @@ class LlamaCppTray:
         while i < len(raw_flags):
             f = raw_flags[i]
             if f in _toggle_flags_no_value:
-                i += 1  # skip flag only
+                i += 1
             elif f in _toggle_flags_always_with_value:
-                i += 2  # skip flag + its value
+                i += 2
             elif f in _toggle_flags_q8_only:
                 next_val = raw_flags[i + 1] if i + 1 < len(raw_flags) else ""
                 if next_val == "q8_0":
-                    i += 2  # toggle-owned — skip both
+                    i += 2
                 else:
-                    # User-typed custom value (e.g. bf16) — keep both tokens
                     clean_flags.append(f)
                     if next_val:
                         clean_flags.append(next_val)
@@ -562,7 +733,6 @@ class LlamaCppTray:
         _section_label(scroll, "Flag Presets")
 
         def create_preset_row(preset_num, parent):
-            """Create a single preset row inside the given parent frame."""
             flags_key   = f"preset_{preset_num}_flags"
             name_key    = f"preset_{preset_num}_name"
             preset_name = self.config.get(name_key, f"Preset {preset_num}")
@@ -581,6 +751,7 @@ class LlamaCppTray:
                 self.config["context_window"]  = self.config.get(f"preset_{n}_context", 32000)
                 self.config["port"]            = self.config.get(f"preset_{n}_port", 8080)
                 self.config["max_models"]      = self.config.get(f"preset_{n}_max_models", 1)
+                self.config["spec_draft_n_max"] = self.config.get(f"preset_{n}_spec_draft_n_max", 0)
                 self.config["flags"]           = preset_flags
                 self.config["use_fit"]         = "--fit" in preset_flags
                 self.config["no_mmproj"]       = "--no-mmproj" in preset_flags
@@ -591,15 +762,8 @@ class LlamaCppTray:
                                                    _preset_kv_value(preset_flags, "-ctk") == "q8_0")
                 self.config["ctv_q8"]          = ("-ctv" in preset_flags and
                                                    _preset_kv_value(preset_flags, "-ctv") == "q8_0")
-                if "--chat-template-kwargs" in preset_flags:
-                    idx = preset_flags.index("--chat-template-kwargs")
-                    if idx + 1 < len(preset_flags):
-                        kwargs = preset_flags[idx + 1]
-                        self.config["thinking"] = "true" if '"enable_thinking": true' in kwargs else "false"
-                    else:
-                        self.config["thinking"] = "off"
-                else:
-                    self.config["thinking"] = "off"
+                self.config["thinking"]         = "--reasoning" in preset_flags
+                self.config["spec_draft_n_max"] = _preset_kv_value(preset_flags, "--spec-draft-n-max") or 0
                 self.save_config()
                 self.create_custom_batch()
                 root.destroy()
@@ -621,28 +785,30 @@ class LlamaCppTray:
                     base_flags += ["-ctk", "q8_0"]
                 if ctv_q8_var.get():
                     base_flags += ["-ctv", "q8_0"]
-                if thinking_var.get() != "off":
-                    base_flags += ["--chat-template-kwargs",
-                                   '{"enable_thinking": ' + thinking_var.get() + '}']
+                if thinking_var.get():
+                    base_flags += ["--reasoning", "on"]
+                mtp_val = mtp_var.get()
+                if mtp_val > 0:
+                    base_flags += ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(mtp_val)]
                 self.config[f"preset_{n}_flags"]       = base_flags
                 self.config[f"preset_{n}_name"]        = nv.get()
                 self.config[f"preset_{n}_context"]     = ctx_var.get()
                 self.config[f"preset_{n}_port"]        = port_var.get()
                 self.config[f"preset_{n}_max_models"]  = max_models_var.get()
+                self.config[f"preset_{n}_spec_draft_n_max"] = mtp_var.get()
                 self.config["flags"]                   = base_flags
                 self.save_config()
                 self.create_custom_batch()
 
             ctk.CTkButton(preset_frame, text="Load", width=52, height=30,
                           fg_color=ACCENT, hover_color=ACCENT2,
-                          font=FONT_BODY,
+                          text_color="#1a1a2e", font=FONT_BODY,
                           command=lambda p=preset_num: load_preset(p)).pack(side="left", padx=(0, 4))
             ctk.CTkButton(preset_frame, text="Save", width=52, height=30,
                           fg_color=SUCCESS, hover_color="#2fa882",
-                          font=FONT_BODY,
+                          text_color="#1a1a2e", font=FONT_BODY,
                           command=lambda p=preset_num: save_preset(p)).pack(side="left", padx=(0, 4))
 
-        # ── 2-column grid: presets 1–3 left, 4–6 right ──────────────────────
         presets_grid = ctk.CTkFrame(scroll, fg_color="transparent")
         presets_grid.pack(fill="x", padx=24, pady=(2, 4))
         presets_grid.columnconfigure(0, weight=1)
@@ -656,9 +822,11 @@ class LlamaCppTray:
         create_preset_row(1, left_col)
         create_preset_row(2, left_col)
         create_preset_row(3, left_col)
-        create_preset_row(4, right_col)
+        create_preset_row(4, left_col)
         create_preset_row(5, right_col)
         create_preset_row(6, right_col)
+        create_preset_row(7, right_col)
+        create_preset_row(8, right_col)
 
         # ── SECTION: Paths ──────────────────────────────────────────────────
         _section_label(scroll, "Paths")
@@ -694,6 +862,7 @@ class LlamaCppTray:
             self.config["context_window"]  = ctx_var.get()
             self.config["port"]            = port_var.get()
             self.config["max_models"]      = max_models_var.get()
+            self.config["spec_draft_n_max"] = mtp_var.get()
             self.config["models_dir"]      = models_dir_var.get()
             self.config["llamacpp_dir"]    = llamacpp_dir_var.get()
             self.config["use_fit"]         = fit_var.get()
@@ -706,6 +875,7 @@ class LlamaCppTray:
             self.config["thinking"]        = thinking_var.get()
             self.config["embedding_model"] = embedding_model_var.get()
             self.config["embedding_port"]  = embedding_port_var.get()
+            self.config["icon_color_index"] = color_idx_var.get()   # NEW
 
             base_flags = flags_var.get().strip().split() if flags_var.get().strip() else []
             if no_mmap_var.get():
@@ -722,36 +892,47 @@ class LlamaCppTray:
                 base_flags += ["-ctk", "q8_0"]
             if ctv_q8_var.get():
                 base_flags += ["-ctv", "q8_0"]
-            if thinking_var.get() != "off":
-                base_flags += ["--chat-template-kwargs",
-                               '{"enable_thinking": ' + thinking_var.get() + '}']
+            if thinking_var.get():
+                base_flags += ["--reasoning", "on"]
+            mtp_val = mtp_var.get()
+            if mtp_val > 0:
+                base_flags += ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(mtp_val)]
             self.config["flags"] = base_flags
 
             emb = embedding_flags_var.get().strip()
             self.config["embedding_flags"] = emb.split() if emb else []
 
             if self.save_config():
+                # Refresh the tray icon to use the new colour immediately
+                self.update_icon()
                 self.create_custom_batch()
                 root.destroy()
             else:
                 feedback_var.set("⚠  Failed to save — check file permissions.")
 
-        def toggle_server_switch(is_on):
-            import threading
+        def toggle_server_switch(_):
+            server_switch.configure(state="disabled")
+            was_running = self.server_running
             def run_toggle():
-                if is_on:
-                    self.start_server(None, None)
-                else:
-                    self.stop_server(None, None)
+                try:
+                    if not was_running:
+                        self.start_server(None, None)
+                    else:
+                        self.stop_server(None, None)
+                finally:
+                    def update_switch():
+                        self.update_status()
+                        root.after(0, lambda: server_switch.configure(state="normal"))
+                    root.after(0, update_switch)
             threading.Thread(target=run_toggle, daemon=True).start()
 
         ctk.CTkButton(btn_frm, text="Save", width=110, height=38,
                       fg_color=SUCCESS, hover_color="#2fa882",
-                      font=FONT_HEADER, command=save_and_close).pack(
+                      text_color="#1a1a2e", font=FONT_HEADER, command=save_and_close).pack(
             side="left", padx=(20, 6), pady=11)
         ctk.CTkButton(btn_frm, text="Cancel", width=90, height=38,
                       fg_color=BG_CARD, hover_color=BG_MID,
-                      font=FONT_BODY, command=root.destroy).pack(
+                      text_color=TEXT, font=FONT_BODY, command=root.destroy).pack(
             side="left", padx=6, pady=11)
         server_switch = ctk.CTkSwitch(btn_frm, text="Server",
                                       command=lambda: toggle_server_switch(server_switch.get()))
@@ -784,15 +965,8 @@ class LlamaCppTray:
         i = 0
         while i < len(flags):
             flag = flags[i]
-            if flag == "--chat-template-kwargs" and i + 1 < len(flags):
-                json_val = flags[i + 1]
-                escaped  = '"' + json_val.replace('"', '\\"') + '"'
-                safe_flags_parts.append("--chat-template-kwargs")
-                safe_flags_parts.append(escaped)
-                i += 2
-            else:
-                safe_flags_parts.append(flag)
-                i += 1
+            safe_flags_parts.append(flag)
+            i += 1
 
         flags_str  = " ".join(safe_flags_parts)
         llama_dir  = self.config.get("llamacpp_dir", "")
@@ -847,7 +1021,6 @@ class LlamaCppTray:
     #  PRESET ACTIONS (called from tray menu)
     # ════════════════════════════════════════════════════════════════════════
     def _apply_preset(self, preset_num):
-        """Load a preset, rebuild the batch, optionally restart the server."""
         flags_key    = f"preset_{preset_num}_flags"
         preset_flags = self.config.get(flags_key, [])
 
@@ -858,6 +1031,7 @@ class LlamaCppTray:
         self.config["context_window"]      = self.config.get(f"preset_{preset_num}_context", 32000)
         self.config["port"]                = self.config.get(f"preset_{preset_num}_port", 8080)
         self.config["max_models"]          = self.config.get(f"preset_{preset_num}_max_models", 1)
+        self.config["spec_draft_n_max"]    = self.config.get(f"preset_{preset_num}_spec_draft_n_max", 0)
         self.config["flags"]               = preset_flags
         self.config["use_fit"]             = "--fit" in preset_flags
         self.config["no_mmproj"]           = "--no-mmproj" in preset_flags
@@ -872,21 +1046,13 @@ class LlamaCppTray:
             "-ctv" in preset_flags and
             self._preset_kv_value(preset_flags, "-ctv") == "q8_0"
         )
-        if "--chat-template-kwargs" in preset_flags:
-            idx = preset_flags.index("--chat-template-kwargs")
-            if idx + 1 < len(preset_flags):
-                kwargs = preset_flags[idx + 1]
-                self.config["thinking"] = "true" if '"enable_thinking": true' in kwargs else "false"
-            else:
-                self.config["thinking"] = "off"
-        else:
-            self.config["thinking"] = "off"
+        self.config["thinking"]         = "--reasoning" in preset_flags
+        self.config["spec_draft_n_max"] = self._preset_kv_value(preset_flags, "--spec-draft-n-max") or 0
 
         self.save_config()
         self.create_custom_batch()
         print(f"Preset {preset_num} applied.")
 
-        # If server is running, restart it with the new flags
         if self.server_running:
             print("Restarting server with new preset…")
             self.stop_server(None, None)
@@ -894,7 +1060,6 @@ class LlamaCppTray:
             self.start_server_internal()
 
     def _make_preset_action(self, n):
-        """Return a callable suitable for pystray that applies preset n."""
         def action(icon, item):
             threading.Thread(target=self._apply_preset, args=(n,), daemon=True).start()
         return action
@@ -922,7 +1087,7 @@ class LlamaCppTray:
                 print("Starting server...")
                 custom_bat = self.create_custom_batch()
                 subprocess.run([str(custom_bat)], shell=True, check=True)
-                time.sleep(2)
+                time.sleep(0.25)
                 self.update_status()
             except subprocess.CalledProcessError as e:
                 print(f"Error starting server: {e}")
@@ -935,7 +1100,7 @@ class LlamaCppTray:
             try:
                 subprocess.run(['taskkill', '/IM', 'llama-server.exe', '/T', '/F'],
                                shell=True, check=True)
-                time.sleep(1)
+                time.sleep(0.15)
             except subprocess.CalledProcessError as e:
                 print(f"Error stopping server: {e}")
 
@@ -1095,11 +1260,10 @@ class LlamaCppTray:
 
     # ── mmproj toggle ────────────────────────────────────────────────────────
     def toggle_mmproj(self, icon, item):
-        """Flip the --no-mmproj flag, save config, rebuild batch."""
+        was_running = self.server_running
         current = self.config.get("no_mmproj", False)
         self.config["no_mmproj"] = not current
 
-        # Keep the flags list consistent with the new toggle state
         flags = self.config.get("flags", [])
         if self.config["no_mmproj"]:
             if "--no-mmproj" not in flags:
@@ -1113,11 +1277,47 @@ class LlamaCppTray:
         state = "ON (--no-mmproj active)" if self.config["no_mmproj"] else "OFF"
         print(f"mmproj toggled: {state}")
 
-    # ── build tray menu (called at startup and after config changes) ─────────
+        if was_running:
+            print("Restarting server to apply mmproj change…")
+            self.stop_server(None, None)
+            time.sleep(1)
+            self.start_server_internal()
+
+    def toggle_thinking(self, icon, item):
+        was_running = self.server_running
+        current = self.config.get("thinking", False)
+        self.config["thinking"] = not current
+
+        flags = self.config.get("flags", [])
+        if self.config["thinking"]:
+            if "--reasoning" not in flags:
+                flags += ["--reasoning", "on"]
+        else:
+            i = 0
+            while i < len(flags):
+                if flags[i] == "--reasoning":
+                    flags.pop(i)
+                    if i < len(flags):
+                        flags.pop(i)
+                    break
+                i += 1
+        self.config["flags"] = flags
+
+        self.save_config()
+        self.create_custom_batch()
+        state = "ON (--reasoning)" if self.config["thinking"] else "OFF"
+        print(f"Thinking toggled: {state}")
+
+        if was_running:
+            print("Restarting server to apply thinking change…")
+            self.stop_server(None, None)
+            time.sleep(1)
+            self.start_server_internal()
+
+    # ── build tray menu ──────────────────────────────────────────────────────
     def _build_menu(self):
-        """Build the pystray Menu, pulling live preset names from config."""
         preset_items = []
-        for n in range(1, 7):
+        for n in range(1, 9):
             name = self.config.get(f"preset_{n}_name", f"Preset {n}").strip() or f"Preset {n}"
             has_flags = bool(self.config.get(f"preset_{n}_flags"))
             label = name if has_flags else f"{name} (empty)"
@@ -1135,6 +1335,8 @@ class LlamaCppTray:
             pystray.MenuItem("Start Embedding Server", self.toggle_embedding_server),
             pystray.MenuItem("Disable Vision", self.toggle_mmproj,
                              checked=lambda item: self.config.get("no_mmproj", False)),
+            pystray.MenuItem("Thinking", self.toggle_thinking,
+                             checked=lambda item: self.config.get("thinking", False)),
             pystray.MenuItem("Stop Server",            self.stop_server),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self.on_quit),
@@ -1151,7 +1353,7 @@ class LlamaCppTray:
             self.show_setup_wizard()
 
         self.icon       = pystray.Icon("llamacpp_server")
-        self.icon.icon  = self.load_icon()
+        self.icon.icon  = self.load_icon(running=False)
         self.icon.title = "Llama.cpp Server"
         self.icon.menu  = self._build_menu()
 
