@@ -1,13 +1,14 @@
 import os
 import pystray
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 import subprocess
 import time
 import threading
 from pathlib import Path
+import ctypes
+import ctypes.wintypes
 import json
-import tkinter as tk
 from tkinter import messagebox, filedialog
 import customtkinter as ctk
 import requests
@@ -85,6 +86,79 @@ FONT_HEADER = ("Segoe UI", 12, "bold")
 FONT_BODY   = ("Segoe UI", 11)
 FONT_SMALL  = ("Segoe UI", 9)
 
+# ── VRAM (pynvml) ───────────────────────────────────────────────────────────
+_pynvml = None  # None = not tried yet, False = unavailable
+
+
+def vram_snapshot():
+    """Return a list of (used_bytes, total_bytes) tuples — one per NVIDIA GPU.
+    Returns None if pynvml is missing or no GPU is detected."""
+    global _pynvml
+    if _pynvml is None:
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            _pynvml = pynvml
+        except Exception:
+            _pynvml = False
+            return None
+    if _pynvml is False:
+        return None
+    try:
+        out = []
+        for i in range(_pynvml.nvmlDeviceGetCount()):
+            h = _pynvml.nvmlDeviceGetHandleByIndex(i)
+            m = _pynvml.nvmlDeviceGetMemoryInfo(h)
+            out.append((m.used, m.total))
+        return out
+    except Exception:
+        return None
+
+
+
+# ── Speculative decoding types (values for --spec-type) ─────────────────────
+# Order = dropdown order; first entry is the default. "none" is intentionally
+# omitted — a spec draft N of 0 disables speculative decoding entirely.
+SPEC_TYPES = [
+    "draft-mtp",
+    "ngram-mod",
+    "ngram-simple",
+    "ngram-map-k",
+    "ngram-map-k4v",
+    "ngram-cache",
+    "draft-simple",
+    "draft-eagle3",
+    "draft-dflash",
+    "draft-dspark",
+]
+
+
+# Types that have no draft length — --spec-draft-n-max does not apply to
+# them (ngram-mod has its own n-min/n-max, ngram-cache is statistics-based).
+SPEC_NO_NMAX = {"ngram-mod", "ngram-cache"}
+
+
+def spec_flags_for(spec_type, n_max):
+    """Build the --spec-type / --spec-draft-n-max flags.
+
+    Returns [] when n_max is 0 (speculative decoding disabled) so the
+    --spec-type flag is never emitted automatically.  For types that don't
+    use a draft length (see SPEC_NO_NMAX) the N value is ignored entirely —
+    selecting the type alone enables it.
+    """
+    if spec_type not in SPEC_TYPES:
+        spec_type = "draft-mtp"
+    if spec_type in SPEC_NO_NMAX:
+        return ["--spec-type", spec_type]
+    try:
+        n = int(n_max)
+    except (TypeError, ValueError):
+        return []
+    if n <= 0:
+        return []
+    return ["--spec-type", spec_type, "--spec-draft-n-max", str(n)]
+
+
 # ── 10 icon overlay colours the user can cycle through ──────────────────────
 ICON_COLORS = [
     ("#4f8ef7", "Blue"),
@@ -102,10 +176,10 @@ ICON_COLORS = [
 
 def _section_label(parent, text):
     frm = ctk.CTkFrame(parent, fg_color="transparent")
-    frm.pack(fill="x", padx=20, pady=(14, 2))
+    frm.pack(fill="x", padx=20, pady=(6, 1))
     ctk.CTkLabel(frm, text=text, font=FONT_HEADER,
                  text_color=ACCENT).pack(anchor="w")
-    ctk.CTkFrame(frm, height=1, fg_color=ACCENT2).pack(fill="x", pady=(3, 0))
+    ctk.CTkFrame(frm, height=1, fg_color=ACCENT2).pack(fill="x", pady=(2, 0))
 
 
 def _row(parent, label_text, widget_factory, pady=4, height=36):
@@ -132,6 +206,8 @@ class LlamaCppTray:
         self.click_timer                    = None
         self.running                        = False
         self.embedding_server_check_counter = 0
+        self._icon_update_needed            = threading.Event()
+        self._vram = None  # (used_bytes, total_bytes) — None until first read
         self.load_config()
 
     # ── signal / lifecycle ──────────────────────────────────────────────────
@@ -162,6 +238,7 @@ class LlamaCppTray:
             "thinking": False,
             "max_models": 1,
             "spec_draft_n_max": 0,
+            "spec_type": "draft-mtp",
             "flags": [],
             "theme": "dark",
             "embedding_model": "",
@@ -185,6 +262,7 @@ class LlamaCppTray:
             "preset_7_name": "Preset 7",
             "preset_8_flags": [],
             "preset_8_name": "Preset 8",
+            "icon_type": "favicon-dark",
         }
         try:
             if self.config_file.exists():
@@ -253,13 +331,56 @@ class LlamaCppTray:
         if was_running != self.server_running or was_embedding_running != self.embedding_server_running:
             self.update_icon()
 
-    def update_icon(self):
-        if self.server_running:
-            self.icon.icon  = self.load_icon(running=True)
-            self.icon.title = "Llama.cpp - Running"
+    def _do_update_icon(self):
+        """Actually re-register the tray icon so the new image is picked up.
+        Must be called from the pystray main (event) thread."""
+        vram = self._vram
+        vram_mode = self.config.get("icon_type", "favicon-dark") == "vram"
+        if vram_mode:
+            self.icon.icon = self._vram_icon_image(
+                None if vram is None else vram[0],
+                None if vram is None else vram[1],
+                self.server_running)
+        elif self.server_running:
+            self.icon.icon = self.load_icon(running=True)
         else:
-            self.icon.icon  = self.load_icon(running=False)
-            self.icon.title = "Llama.cpp - Stopped"
+            self.icon.icon = self.load_icon(running=False)
+
+        # tooltip: always show VRAM when a reading is available
+        if vram is not None:
+            used, total = vram
+            self.icon.title = (f"VRAM {used / 2**30:.1f} / {total / 2**30:.1f} GB\n"
+                               f"Server: {'Running' if self.server_running else 'Stopped'}")
+        elif vram_mode:
+            self.icon.title = "Llama.cpp - VRAM unavailable"
+        else:
+            self.icon.title = ("Llama.cpp - "
+                               f"{'Running' if self.server_running else 'Stopped'}")
+        # Force Windows to redraw the notification area icon via shell notification
+        try:
+            ctypes.windll.shell32.Shell_NotifyIconW(
+                0x00000000,  # NIM_DELETE
+                None)
+            ctypes.windll.shell32.Shell_NotifyIconW(
+                0x00000001,  # NIM_MODIFY (re-register triggers redraw)
+                None)
+        except Exception:
+            pass
+
+    def update_icon(self):
+        """Update the tray icon — safe to call from any thread.
+
+        If called from the pystray event thread the change is applied
+        immediately.  If called from a background thread (e.g. the
+        monitor thread) we set an event so the main thread picks it up."""
+        try:
+            self._do_update_icon()
+        except Exception:
+            pass
+        # Always signal so the main-thread watchdog also refreshes — this
+        # guarantees the overlay appears even when pystray drops the
+        # background-thread assignment.
+        self._icon_update_needed.set()
 
     # ── icon helpers ────────────────────────────────────────────────────────
     def create_image(self, color='red'):
@@ -268,23 +389,40 @@ class LlamaCppTray:
         dc.rectangle([16, 16, 48, 48], fill='white')
         return image
 
+    ICON_TYPES = {
+        "old_logo": "llamacpp_tray.ico",
+        "favicon-dark": "favicon-dark.ico",
+        "favicon": "favicon.ico",
+        "vram": None,  # special mode: show the VRAM readout instead of an icon
+    }
+
+    def _base_icon_image(self):
+        """Return the raw selected icon as an RGBA image, or None if missing."""
+        icon_key = self.config.get("icon_type", "favicon-dark")
+        icon_filename = self.ICON_TYPES.get(icon_key, "favicon-dark.ico")
+        if not icon_filename:
+            return None  # vram mode — no static icon
+        icon_path = Path(__file__).parent / icon_filename
+        if icon_path.exists() and icon_path.stat().st_size > 0:
+            try:
+                return Image.open(icon_path).convert('RGBA')
+            except Exception:
+                pass
+        return None
+
     def load_icon(self, running=None, color=None):
         """Build the tray icon image — red tint overlay when server is not running."""
         # legacy compat for callers that pass `color='green'`
         if color is not None and running is None:
             running = (color == 'green')
 
-        icon_path = Path(__file__).parent / "llamacpp_tray.ico"
-        if icon_path.exists() and icon_path.stat().st_size > 0:
-            try:
-                base = Image.open(icon_path).convert('RGBA')
-                if not running:
-                    # red tint overlay when server is stopped
-                    overlay = Image.new('RGBA', base.size, (255, 0, 0, 50))
-                    return Image.alpha_composite(base, overlay)
-                return base
-            except Exception:
-                pass
+        base = self._base_icon_image()
+        if base is not None:
+            if not running:
+                # red tint overlay when server is stopped
+                overlay = Image.new('RGBA', base.size, (255, 0, 0, 50))
+                return Image.alpha_composite(base, overlay)
+            return base
 
         # fallback: red square when stopped, white when running
         fallback_color = 'red' if not running else 'white'
@@ -451,26 +589,26 @@ class LlamaCppTray:
         root = ctk.CTk()
         root.title("ToggleLlama")
         root.resizable(True, True)
-        root.minsize(500, 700)
+        root.minsize(480, 520)
         root.configure(fg_color=BG_DARK)
 
         root.update_idletasks()
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         margin = 50
-        x_pos = sw - 620 - margin
-        y_pos = max(0, sh - 900)
-        root.geometry(f"620x860+{x_pos}+{y_pos}")
+        x_pos = sw - 560 - margin
+        y_pos = max(0, sh - 760)
+        root.geometry(f"560x740+{x_pos}+{y_pos}")
         root.lift()
         root.attributes("-topmost", True)
         root.focus_force()
         root.after(150, lambda: root.attributes("-topmost", False))
 
-        hdr = ctk.CTkFrame(root, fg_color=BG_CARD, corner_radius=0, height=64)
+        hdr = ctk.CTkFrame(root, fg_color=BG_CARD, corner_radius=0, height=44)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
         ctk.CTkLabel(hdr, text="⚙  Configuration",
-                     font=("Segoe UI", 16, "bold"), text_color=ACCENT).pack(
-            side="left", padx=20, pady=14)
+                     font=("Segoe UI", 14, "bold"), text_color=ACCENT).pack(
+            side="left", padx=20, pady=6)
 
         status_text = "● Running" if self.server_running else "● Stopped"
         status_col  = SUCCESS if self.server_running else DANGER
@@ -486,10 +624,10 @@ class LlamaCppTray:
 
         def lentry(parent, label, var, width=None, placeholder=""):
             frm = ctk.CTkFrame(parent, fg_color="transparent")
-            frm.pack(fill="x", padx=24, pady=3)
+            frm.pack(fill="x", padx=24, pady=2)
             ctk.CTkLabel(frm, text=label, font=FONT_BODY,
-                         text_color=TEXT, width=200, anchor="w").pack(side="left")
-            kw = dict(textvariable=var, height=34, fg_color=BG_MID,
+                         text_color=TEXT, width=140, anchor="w").pack(side="left")
+            kw = dict(textvariable=var, height=24, fg_color=BG_MID,
                       border_color=ACCENT2, text_color=TEXT,
                       font=FONT_BODY, placeholder_text=placeholder)
             if width:
@@ -500,10 +638,10 @@ class LlamaCppTray:
 
         def browse_row(parent, label, var, mode="dir"):
             frm = ctk.CTkFrame(parent, fg_color="transparent")
-            frm.pack(fill="x", padx=24, pady=3)
+            frm.pack(fill="x", padx=24, pady=2)
             ctk.CTkLabel(frm, text=label, font=FONT_BODY,
-                         text_color=TEXT, width=200, anchor="w").pack(side="left")
-            entry = ctk.CTkEntry(frm, textvariable=var, height=34,
+                         text_color=TEXT, width=140, anchor="w").pack(side="left")
+            entry = ctk.CTkEntry(frm, textvariable=var, height=24,
                                  fg_color=BG_MID, border_color=ACCENT2,
                                  text_color=TEXT, font=FONT_BODY)
             entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
@@ -520,7 +658,7 @@ class LlamaCppTray:
                     if f:
                         var.set(f)
 
-            ctk.CTkButton(frm, text="…", width=36, height=34,
+            ctk.CTkButton(frm, text="…", width=36, height=24,
                           fg_color=ACCENT2, hover_color=ACCENT,
                           command=browse).pack(side="right")
 
@@ -531,42 +669,66 @@ class LlamaCppTray:
         ctx_lbl_var = ctk.StringVar(value=f"Context: {ctx_var.get():,}")
 
         ctx_frm = ctk.CTkFrame(scroll, fg_color="transparent")
-        ctx_frm.pack(fill="x", padx=24, pady=3)
+        ctx_frm.pack(fill="x", padx=24, pady=2)
         ctk.CTkLabel(ctx_frm, text="Context Window", font=FONT_BODY,
-                     text_color=TEXT, width=200, anchor="w").pack(side="left")
+                     text_color=TEXT, width=110, anchor="w").pack(side="left")
         slider = ctk.CTkSlider(ctx_frm, from_=1000, to=256000,
-                               variable=ctx_var, width=220,
+                               variable=ctx_var, width=160,
                                button_color=ACCENT, progress_color=ACCENT2,
                                command=lambda v: [ctx_var.set(int(v)),
                                                   ctx_lbl_var.set(f"Context: {int(v):,}")])
         slider.pack(side="left", padx=(0, 8))
-        ctk.CTkEntry(ctx_frm, textvariable=ctx_var, width=80, height=34,
+        ctk.CTkEntry(ctx_frm, textvariable=ctx_var, width=80, height=24,
                      fg_color=BG_MID, border_color=ACCENT2,
                      text_color=TEXT, font=FONT_BODY).pack(side="left", padx=(0, 8))
         ctk.CTkLabel(ctx_frm, textvariable=ctx_lbl_var,
-                     font=FONT_SMALL, text_color=TEXT_DIM, width=140).pack(side="left")
+                     font=FONT_SMALL, text_color=TEXT_DIM, width=110).pack(side="left")
 
         port_var       = ctk.IntVar(value=self.config["port"])
         max_models_var = ctk.IntVar(value=self.config.get("max_models", 1))
         mtp_var        = ctk.IntVar(value=self.config.get("spec_draft_n_max", 0))
         lentry(scroll, "Server Port",  port_var,       width=100)
 
-        # Max Models + MTP on one row
+        # Max Models + Speculative Decoding on one row
+        init_flags = self.config.get("flags", [])
+        init_spec_type = self._preset_kv_value(init_flags, "--spec-type") \
+                         or self.config.get("spec_type", "draft-mtp")
+        if init_spec_type not in SPEC_TYPES:
+            init_spec_type = "draft-mtp"
+        spec_type_var = ctk.StringVar(value=init_spec_type)
+
         mtp_row = ctk.CTkFrame(scroll, fg_color="transparent")
-        mtp_row.pack(fill="x", padx=24, pady=3)
+        mtp_row.pack(fill="x", padx=24, pady=2)
         ctk.CTkLabel(mtp_row, text="Max Models", font=FONT_BODY,
-                     text_color=TEXT, width=200, anchor="w").pack(side="left")
-        ctk.CTkEntry(mtp_row, textvariable=max_models_var, width=60, height=34,
+                     text_color=TEXT, width=90, anchor="w").pack(side="left")
+        ctk.CTkEntry(mtp_row, textvariable=max_models_var, width=60, height=24,
                      fg_color=BG_MID, border_color=ACCENT2,
                      text_color=TEXT, font=FONT_BODY).pack(side="left", padx=(0, 12))
-        ctk.CTkLabel(mtp_row, text="MTP", font=FONT_BODY,
-                     text_color=TEXT, width=40, anchor="w").pack(side="left")
-        mtp_spin = ctk.CTkEntry(mtp_row, textvariable=mtp_var, width=70, height=34,
+        def _sync_nmax_enabled(_=None):
+            """Grey out the N spin for types that don't use --spec-draft-n-max."""
+            state = "disabled" if spec_type_var.get() in SPEC_NO_NMAX else "normal"
+            mtp_spin.configure(state=state)
+
+        ctk.CTkLabel(mtp_row, text="Spec Type", font=FONT_BODY,
+                     text_color=TEXT, anchor="w").pack(side="left")
+        ctk.CTkOptionMenu(
+            mtp_row, values=SPEC_TYPES, variable=spec_type_var,
+            width=140, height=26, fg_color=BG_MID, text_color=TEXT,
+            button_color=ACCENT, button_hover_color=ACCENT2,
+            corner_radius=8, font=FONT_BODY,
+            command=_sync_nmax_enabled,
+        ).pack(side="left", padx=(6, 12))
+        ctk.CTkLabel(mtp_row, text="N", font=FONT_BODY,
+                     text_color=TEXT, width=14, anchor="w").pack(side="left")
+        mtp_spin = ctk.CTkEntry(mtp_row, textvariable=mtp_var, width=70, height=24,
                                 fg_color=BG_MID, border_color=ACCENT2,
                                 text_color=TEXT, font=FONT_BODY, justify="center")
         mtp_spin.pack(side="left")
+        _sync_nmax_enabled()
 
         def _mtp_wheel(event):
+            if mtp_spin.cget("state") == "disabled":
+                return "break"
             val = mtp_var.get()
             if event.delta < 0 and val < 6:
                 mtp_var.set(val + 1)
@@ -596,103 +758,27 @@ class LlamaCppTray:
         ctv_q8_var      = ctk.BooleanVar(value=self.config.get("ctv_q8", False))
         thinking_var    = ctk.BooleanVar(value=self.config.get("thinking", False))
 
-        toggles_frm = ctk.CTkFrame(scroll, fg_color="transparent")
-        toggles_frm.pack(fill="x", padx=24, pady=3)
-        ctk.CTkLabel(toggles_frm, text="Quick Flags", font=FONT_BODY,
-                     text_color=TEXT, width=200, anchor="w").pack(side="left")
-        ctk.CTkSwitch(toggles_frm, variable=fit_var, text="--fit",
-                       font=FONT_BODY, text_color=TEXT_DIM,
-                       button_color=ACCENT, progress_color=ACCENT2).pack(side="left", padx=(0, 24))
-        ctk.CTkSwitch(toggles_frm, variable=no_mmproj_var, text="--no-mmproj",
-                       font=FONT_BODY, text_color=TEXT_DIM,
-                       button_color=ACCENT, progress_color=ACCENT2).pack(side="left", padx=(0, 24))
-        ctk.CTkSwitch(toggles_frm, variable=flash_attn_var, text="--flash-attn on",
-                       font=FONT_BODY, text_color=TEXT_DIM,
-                       button_color=ACCENT, progress_color=ACCENT2).pack(side="left")
-
-        toggles_frm2 = ctk.CTkFrame(scroll, fg_color="transparent")
-        toggles_frm2.pack(fill="x", padx=24, pady=3)
-        ctk.CTkLabel(toggles_frm2, text="", font=FONT_BODY,
-                      text_color=TEXT, width=200, anchor="w").pack(side="left")
-        ctk.CTkSwitch(toggles_frm2, variable=no_mmap_var, text="--no-mmap",
-                        font=FONT_BODY, text_color=TEXT_DIM,
-                        button_color=ACCENT, progress_color=ACCENT2).pack(side="left", padx=(0, 24))
-        ctk.CTkSwitch(toggles_frm2, variable=webui_mcp_var, text="--webui-mcp-proxy",
-                        font=FONT_BODY, text_color=TEXT_DIM,
-                        button_color=ACCENT, progress_color=ACCENT2).pack(side="left")
-
-        kv_frm = ctk.CTkFrame(scroll, fg_color="transparent")
-        kv_frm.pack(fill="x", padx=24, pady=3)
-        ctk.CTkLabel(kv_frm, text="KV Cache  (q8_0)", font=FONT_BODY,
-                     text_color=TEXT, width=200, anchor="w").pack(side="left")
-        ctk.CTkSwitch(kv_frm, variable=ctk_q8_var, text="-ctk q8_0",
-                       font=FONT_BODY, text_color=TEXT_DIM,
-                       button_color=ACCENT, progress_color=ACCENT2).pack(side="left", padx=(0, 24))
-        ctk.CTkSwitch(kv_frm, variable=ctv_q8_var, text="-ctv q8_0",
-                      font=FONT_BODY, text_color=TEXT_DIM,
-                      button_color=ACCENT, progress_color=ACCENT2).pack(side="left")
-
-        think_frm = ctk.CTkFrame(scroll, fg_color="transparent")
-        think_frm.pack(fill="x", padx=24, pady=3)
-        ctk.CTkLabel(think_frm, text="Thinking Mode", font=FONT_BODY,
-                     text_color=TEXT, width=200, anchor="w").pack(side="left")
-        ctk.CTkSwitch(think_frm, variable=thinking_var, text="--reasoning on",
-                      font=FONT_BODY, text_color=TEXT_DIM,
-                      button_color=ACCENT, progress_color=ACCENT2).pack(side="left")
-
-        # ── SECTION: Theme Colour ────────────────────────────────────────────
-        _section_label(scroll, "Theme Colour")
-
-        color_idx_var = ctk.IntVar(value=self.config.get("icon_color_index", 0))
-        swatch_buttons = []
-
-        color_name_var = ctk.StringVar(
-            value=ICON_COLORS[color_idx_var.get()][1])
-
-        def _apply_and_select(idx):
-            """Select a colour, update the live theme globals, and refresh the window."""
-            color_idx_var.set(idx)
-            hex_col = ICON_COLORS[idx][0]
-            color_name_var.set(ICON_COLORS[idx][1])
-            for i, btn in enumerate(swatch_buttons):
-                border = "#ffffff" if i == idx else "#333355"
-                btn.configure(border_color=border, border_width=2 if i == idx else 1)
-            # Apply theme live by restarting the config window
-            self.config["icon_color_index"] = idx
-            self.save_config()
-            root.destroy()
-            self.show_config()
-
-        for idx, btn in enumerate(swatch_buttons):
-            btn.configure(command=lambda i=idx: _apply_and_select(i))
-
-        color_frm = ctk.CTkFrame(scroll, fg_color="transparent")
-        color_frm.pack(fill="x", padx=24, pady=(4, 8))
-        ctk.CTkLabel(color_frm, text="GUI theme colour", font=FONT_BODY,
-                     text_color=TEXT, width=200, anchor="w").pack(side="left")
-
-        swatch_frm = ctk.CTkFrame(color_frm, fg_color="transparent")
-        swatch_frm.pack(side="left")
-
-        for idx, (hex_col, name) in enumerate(ICON_COLORS):
-            btn = ctk.CTkButton(
-                swatch_frm,
-                text="",
-                width=28,
-                height=28,
-                corner_radius=14,
-                fg_color=hex_col,
-                hover_color=hex_col,
-                border_color="#ffffff" if idx == color_idx_var.get() else "#333355",
-                border_width=2 if idx == color_idx_var.get() else 1,
-                command=lambda i=idx: _apply_and_select(i),
-            )
-            btn.pack(side="left", padx=3)
-            swatch_buttons.append(btn)
-
-        ctk.CTkLabel(color_frm, textvariable=color_name_var,
-                     font=FONT_SMALL, text_color=TEXT_DIM,
-                     width=60).pack(side="left", padx=(10, 0))
+        # Quick flags / KV cache / thinking — compact 3-column switch grid
+        _switch_defs = [
+            (fit_var,       "--fit"),
+            (no_mmproj_var, "--no-mmproj"),
+            (flash_attn_var, "--flash-attn on"),
+            (no_mmap_var,   "--no-mmap"),
+            (webui_mcp_var, "--webui-mcp-proxy"),
+            (ctk_q8_var,    "-ctk q8_0"),
+            (ctv_q8_var,    "-ctv q8_0"),
+            (thinking_var,  "--reasoning on"),
+        ]
+        toggles_grid = ctk.CTkFrame(scroll, fg_color="transparent")
+        toggles_grid.pack(fill="x", padx=24, pady=2)
+        for _ci in range(3):
+            toggles_grid.columnconfigure(_ci, weight=1)
+        for _si, (_svar, _stxt) in enumerate(_switch_defs):
+            ctk.CTkSwitch(toggles_grid, variable=_svar, text=_stxt,
+                          font=FONT_BODY, text_color=TEXT_DIM,
+                          button_color=ACCENT, progress_color=ACCENT2
+                          ).grid(row=_si // 3, column=_si % 3,
+                                 sticky="w", padx=(0, 12), pady=1)
 
         # ── strip toggle-owned flags ─────────────────────────────────────────
         _toggle_flags_no_value        = {"--no-mmproj", "--no-mmap", "--webui-mcp-proxy"}
@@ -722,12 +808,23 @@ class LlamaCppTray:
                 clean_flags.append(f)
                 i += 1
 
-        flags_var = ctk.StringVar(value=" ".join(clean_flags))
-        lentry(scroll, "Additional Flags", flags_var,
-               placeholder="e.g. --gpu-layers 35 -ctk bf16 -ctv bf16")
-        ctk.CTkLabel(scroll, text="   Use this for any flags not covered by the toggles above "
-                                  "(e.g. -ctk bf16, --gpu-layers 35)",
-                     font=FONT_SMALL, text_color=TEXT_DIM).pack(anchor="w", padx=24)
+        line2_str = self.config.get("flags_line2", "")
+        line1 = list(clean_flags)
+        for _t in line2_str.split():
+            if _t in line1:
+                line1.remove(_t)
+        flags_var = ctk.StringVar(value=" ".join(line1))
+        flags_var2 = ctk.StringVar(value=line2_str)
+        for fvar, fph in ((flags_var, "e.g. --gpu-layers 35 -ctk bf16 -ctv bf16"),
+                          (flags_var2, "continued on this line…")):
+            frm = ctk.CTkFrame(scroll, fg_color="transparent")
+            frm.pack(fill="x", padx=24, pady=2)
+            ctk.CTkEntry(frm, textvariable=fvar, height=24, fg_color=BG_MID,
+                         border_color=ACCENT2, text_color=TEXT, font=FONT_BODY,
+                         placeholder_text=fph).pack(side="left", fill="x", expand=True)
+
+        def combined_flags():
+            return (flags_var.get().strip() + " " + flags_var2.get().strip()).split()
 
         # ── SECTION: Flag Presets ────────────────────────────────────────────
         _section_label(scroll, "Flag Presets")
@@ -738,10 +835,10 @@ class LlamaCppTray:
             preset_name = self.config.get(name_key, f"Preset {preset_num}")
 
             preset_frame = ctk.CTkFrame(parent, fg_color=BG_MID)
-            preset_frame.pack(fill="x", pady=4)
+            preset_frame.pack(fill="x", pady=2)
 
             name_var = ctk.StringVar(value=preset_name)
-            ctk.CTkEntry(preset_frame, textvariable=name_var, width=110, height=30,
+            ctk.CTkEntry(preset_frame, textvariable=name_var, width=100, height=24,
                          fg_color=BG_CARD, border_color=ACCENT2, text_color=TEXT,
                          font=FONT_BODY).pack(side="left", padx=(6, 6))
 
@@ -752,7 +849,9 @@ class LlamaCppTray:
                 self.config["port"]            = self.config.get(f"preset_{n}_port", 8080)
                 self.config["max_models"]      = self.config.get(f"preset_{n}_max_models", 1)
                 self.config["spec_draft_n_max"] = self.config.get(f"preset_{n}_spec_draft_n_max", 0)
+                self.config["spec_type"]        = self.config.get(f"preset_{n}_spec_type", "draft-mtp")
                 self.config["flags"]           = preset_flags
+                self.config["flags_line2"]     = self.config.get(f"preset_{n}_flags_line2", "")
                 self.config["use_fit"]         = "--fit" in preset_flags
                 self.config["no_mmproj"]       = "--no-mmproj" in preset_flags
                 self.config["flash_attn"]      = "--flash-attn" in preset_flags
@@ -770,7 +869,7 @@ class LlamaCppTray:
                 self.show_config()
 
             def save_preset(n=preset_num, nv=name_var):
-                base_flags = flags_var.get().strip().split() if flags_var.get().strip() else []
+                base_flags = combined_flags()
                 if fit_var.get():
                     base_flags += ["--fit", "on"]
                 if no_mmap_var.get():
@@ -787,24 +886,27 @@ class LlamaCppTray:
                     base_flags += ["-ctv", "q8_0"]
                 if thinking_var.get():
                     base_flags += ["--reasoning", "on"]
+                stype   = spec_type_var.get()
                 mtp_val = mtp_var.get()
-                if mtp_val > 0:
-                    base_flags += ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(mtp_val)]
+                base_flags += spec_flags_for(stype, mtp_val)
                 self.config[f"preset_{n}_flags"]       = base_flags
+                self.config[f"preset_{n}_flags_line2"] = flags_var2.get().strip()
                 self.config[f"preset_{n}_name"]        = nv.get()
                 self.config[f"preset_{n}_context"]     = ctx_var.get()
                 self.config[f"preset_{n}_port"]        = port_var.get()
                 self.config[f"preset_{n}_max_models"]  = max_models_var.get()
-                self.config[f"preset_{n}_spec_draft_n_max"] = mtp_var.get()
+                self.config[f"preset_{n}_spec_draft_n_max"] = mtp_val
+                self.config[f"preset_{n}_spec_type"]   = stype
                 self.config["flags"]                   = base_flags
+                self.config["flags_line2"]             = flags_var2.get().strip()
                 self.save_config()
                 self.create_custom_batch()
 
-            ctk.CTkButton(preset_frame, text="Load", width=52, height=30,
+            ctk.CTkButton(preset_frame, text="Load", width=48, height=24,
                           fg_color=ACCENT, hover_color=ACCENT2,
                           text_color="#1a1a2e", font=FONT_BODY,
                           command=lambda p=preset_num: load_preset(p)).pack(side="left", padx=(0, 4))
-            ctk.CTkButton(preset_frame, text="Save", width=52, height=30,
+            ctk.CTkButton(preset_frame, text="Save", width=48, height=24,
                           fg_color=SUCCESS, hover_color="#2fa882",
                           text_color="#1a1a2e", font=FONT_BODY,
                           command=lambda p=preset_num: save_preset(p)).pack(side="left", padx=(0, 4))
@@ -827,6 +929,92 @@ class LlamaCppTray:
         create_preset_row(6, right_col)
         create_preset_row(7, right_col)
         create_preset_row(8, right_col)
+
+        # ── SECTION: Theme Colour ────────────────────────────────────────────
+        _section_label(scroll, "Theme Colour")
+
+        color_idx_var = ctk.IntVar(value=self.config.get("icon_color_index", 0))
+        swatch_buttons = []
+
+        color_name_var = ctk.StringVar(
+            value=ICON_COLORS[color_idx_var.get()][1])
+
+        def _apply_and_select(idx):
+            """Select a colour swatch — persist the choice, close the window,
+            and reopen it so every widget is recreated with the new theme."""
+            self.config["icon_color_index"] = idx
+            root.destroy()
+            self.show_config()
+
+        for idx, btn in enumerate(swatch_buttons):
+            btn.configure(command=lambda i=idx: _apply_and_select(i))
+
+        color_frm = ctk.CTkFrame(scroll, fg_color="transparent")
+        color_frm.pack(fill="x", padx=24, pady=(2, 4))
+        ctk.CTkLabel(color_frm, text="GUI theme colour", font=FONT_BODY,
+                     text_color=TEXT, width=140, anchor="w").pack(side="left")
+
+        swatch_frm = ctk.CTkFrame(color_frm, fg_color="transparent")
+        swatch_frm.pack(side="left")
+
+        for idx, (hex_col, name) in enumerate(ICON_COLORS):
+            btn = ctk.CTkButton(
+                swatch_frm,
+                text="",
+                width=24,
+                height=24,
+                corner_radius=12,
+                fg_color=hex_col,
+                hover_color=hex_col,
+                border_color="#ffffff" if idx == color_idx_var.get() else "#333355",
+                border_width=2 if idx == color_idx_var.get() else 1,
+                command=lambda i=idx: _apply_and_select(i),
+            )
+            btn.pack(side="left", padx=2)
+            swatch_buttons.append(btn)
+
+        ctk.CTkLabel(color_frm, textvariable=color_name_var,
+                     font=FONT_SMALL, text_color=TEXT_DIM,
+                     width=60).pack(side="left", padx=(10, 0))
+
+        # ── SECTION: Tray Icon ────────────────────────────────────────────────
+        icon_type_var = ctk.StringVar()
+
+        icon_type_to_display = {
+            "old_logo": "Old Logo",
+            "favicon-dark": "Dark Mode",
+            "favicon": "Light Mode",
+            "vram": "VRAM",
+        }
+        display_to_icon_type = {v: k for k, v in icon_type_to_display.items()}
+
+        current_key = self.config.get("icon_type", "favicon-dark")
+        display_value = icon_type_to_display.get(current_key, "Dark Mode")
+        icon_type_var.set(display_value)
+
+        def _on_icon_type_change(_=None):
+            """Just track the selection — icon is applied on Save / next restart."""
+            pass
+
+        # Tray icon — compact row under the theme swatches
+        tray_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        tray_row.pack(fill="x", padx=24, pady=(0, 6))
+        ctk.CTkLabel(tray_row, text="Tray Icon", font=FONT_BODY,
+                     text_color=TEXT, width=140, anchor="w").pack(side="left")
+        icon_type_menu = ctk.CTkOptionMenu(
+            tray_row,
+            values=list(icon_type_to_display.values()),
+            variable=icon_type_var,
+            width=200,
+            height=26,
+            fg_color=BG_MID,
+            text_color=TEXT,
+            button_color=ACCENT,
+            button_hover_color=ACCENT2,
+            corner_radius=8,
+            command=_on_icon_type_change,
+        )
+        icon_type_menu.pack(side="left", pady=1)
 
         # ── SECTION: Paths ──────────────────────────────────────────────────
         _section_label(scroll, "Paths")
@@ -854,7 +1042,7 @@ class LlamaCppTray:
                                     font=FONT_SMALL, text_color=SUCCESS)
         feedback_lbl.pack(pady=(6, 0))
 
-        btn_frm = ctk.CTkFrame(root, fg_color=BG_MID, corner_radius=0, height=60)
+        btn_frm = ctk.CTkFrame(root, fg_color=BG_MID, corner_radius=0, height=44)
         btn_frm.pack(fill="x", side="bottom")
         btn_frm.pack_propagate(False)
 
@@ -863,6 +1051,7 @@ class LlamaCppTray:
             self.config["port"]            = port_var.get()
             self.config["max_models"]      = max_models_var.get()
             self.config["spec_draft_n_max"] = mtp_var.get()
+            self.config["spec_type"]        = spec_type_var.get()
             self.config["models_dir"]      = models_dir_var.get()
             self.config["llamacpp_dir"]    = llamacpp_dir_var.get()
             self.config["use_fit"]         = fit_var.get()
@@ -875,9 +1064,12 @@ class LlamaCppTray:
             self.config["thinking"]        = thinking_var.get()
             self.config["embedding_model"] = embedding_model_var.get()
             self.config["embedding_port"]  = embedding_port_var.get()
-            self.config["icon_color_index"] = color_idx_var.get()   # NEW
+            self.config["icon_color_index"] = color_idx_var.get()
+            # Save icon_type from the dropdown selection
+            self.config["icon_type"] = display_to_icon_type.get(
+                icon_type_var.get(), "favicon-dark")
 
-            base_flags = flags_var.get().strip().split() if flags_var.get().strip() else []
+            base_flags = combined_flags()
             if no_mmap_var.get():
                 base_flags.append("--no-mmap")
             if webui_mcp_var.get():
@@ -895,9 +1087,9 @@ class LlamaCppTray:
             if thinking_var.get():
                 base_flags += ["--reasoning", "on"]
             mtp_val = mtp_var.get()
-            if mtp_val > 0:
-                base_flags += ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(mtp_val)]
+            base_flags += spec_flags_for(spec_type_var.get(), mtp_val)
             self.config["flags"] = base_flags
+            self.config["flags_line2"] = flags_var2.get().strip()
 
             emb = embedding_flags_var.get().strip()
             self.config["embedding_flags"] = emb.split() if emb else []
@@ -926,17 +1118,17 @@ class LlamaCppTray:
                     root.after(0, update_switch)
             threading.Thread(target=run_toggle, daemon=True).start()
 
-        ctk.CTkButton(btn_frm, text="Save", width=110, height=38,
+        ctk.CTkButton(btn_frm, text="Save", width=110, height=28,
                       fg_color=SUCCESS, hover_color="#2fa882",
                       text_color="#1a1a2e", font=FONT_HEADER, command=save_and_close).pack(
-            side="left", padx=(20, 6), pady=11)
-        ctk.CTkButton(btn_frm, text="Cancel", width=90, height=38,
+            side="left", padx=(20, 6), pady=8)
+        ctk.CTkButton(btn_frm, text="Cancel", width=90, height=28,
                       fg_color=BG_CARD, hover_color=BG_MID,
                       text_color=TEXT, font=FONT_BODY, command=root.destroy).pack(
-            side="left", padx=6, pady=11)
+            side="left", padx=6, pady=8)
         server_switch = ctk.CTkSwitch(btn_frm, text="Server",
                                       command=lambda: toggle_server_switch(server_switch.get()))
-        server_switch.pack(side="right", padx=20, pady=11)
+        server_switch.pack(side="right", padx=20, pady=8)
 
         root.mainloop()
 
@@ -1048,6 +1240,7 @@ class LlamaCppTray:
         )
         self.config["thinking"]         = "--reasoning" in preset_flags
         self.config["spec_draft_n_max"] = self._preset_kv_value(preset_flags, "--spec-draft-n-max") or 0
+        self.config["spec_type"]        = self._preset_kv_value(preset_flags, "--spec-type") or "draft-mtp"
 
         self.save_config()
         self.create_custom_batch()
@@ -1258,6 +1451,60 @@ class LlamaCppTray:
             self.update_status()
             time.sleep(2)
 
+    # ── VRAM icon (drawn directly into the tray icon) ──────────────────────
+    def _vram_icon_image(self, used, total, running):
+        """64×64 tray icon: used GB centred, thin usage bar along the bottom.
+        White text / accent bar when the server is running, red when stopped.
+        Pass used=None to show a dash (VRAM not yet available)."""
+        img  = Image.new('RGBA', (64, 64), (32, 32, 32, 255))
+        draw = ImageDraw.Draw(img)
+        text = "–" if used is None else f"{used / 2**30:.1f}"
+
+        def _load_font(size):
+            try:
+                return ImageFont.truetype("arialbd.ttf", size)
+            except Exception:
+                try:
+                    return ImageFont.truetype("arial.ttf", size)
+                except Exception:
+                    return ImageFont.load_default()
+
+        # use the largest font that still fits the icon width
+        size = 44
+        while draw.textbbox((0, 0), text, font=_load_font(size))[2] > 60:
+            size -= 2
+            if size < 14:
+                break
+        font = _load_font(size)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        x, y = (64 - tw) // 2, (52 - th) // 2
+        fg = (255, 255, 255) if running else (255, 90, 90)
+        for dx, dy in ((-2, 0), (2, 0), (0, -2), (0, 2)):
+            draw.text((x + dx, y + dy), text, fill=(0, 0, 0), font=font)
+        draw.text((x, y), text, fill=fg, font=font)
+        frac = min(1.0, used / total) if (used is not None and total) else 0.0
+        bar  = (79, 142, 247) if running else (224, 92, 92)
+        draw.rectangle([4, 56, 60, 61], fill=(70, 70, 70))
+        if used is not None:
+            draw.rectangle([4, 56, 4 + max(2, int(56 * frac)), 61], fill=bar)
+        return img
+
+    def _vram_loop(self):
+        """Sample VRAM every 0.5 s and refresh the tray icon when it changes."""
+        while self.running:
+            try:
+                snap = vram_snapshot()
+                if snap is not None:
+                    used  = sum(u for u, _ in snap)
+                    total = sum(t for _, t in snap)
+                    if (used, total) != self._vram:
+                        self._vram = (used, total)
+                        self.update_icon()
+            except Exception:
+                pass
+            time.sleep(0.5)
+
     # ── mmproj toggle ────────────────────────────────────────────────────────
     def toggle_mmproj(self, icon, item):
         was_running = self.server_running
@@ -1359,6 +1606,8 @@ class LlamaCppTray:
 
         self.monitor_thread = threading.Thread(target=self.monitor_server, daemon=True)
         self.monitor_thread.start()
+        self._vram_thread = threading.Thread(target=self._vram_loop, daemon=True)
+        self._vram_thread.start()
         self.update_status()
 
         print("Starting Llama.cpp System Tray Application…")
@@ -1367,9 +1616,45 @@ class LlamaCppTray:
         print("Press Ctrl+C to quit")
 
         try:
-            self.icon.run()
+            self._run_with_icon_watchdog()
         except KeyboardInterrupt:
             self.signal_handler(signal.SIGINT, None)
+
+    def _run_with_icon_watchdog(self):
+        """Run pystray's event loop while polling for icon-update requests
+        from background threads.
+
+        pystray may silently drop icon-image assignments that come from
+        non-event-loop threads.  This watchdog periodically checks a
+        threading.Event and re-applies the icon on the main thread when
+        the monitor thread detects a server-status change."""
+        import queue
+        icon_q = queue.Queue()
+
+        def _pystray_main():
+            try:
+                self.icon.run()
+            finally:
+                icon_q.put(None)  # sentinel to unblock the watchdog
+
+        t = threading.Thread(target=_pystray_main, daemon=True)
+        t.start()
+
+        # Main thread: poll for icon updates until pystray exits
+        while True:
+            try:
+                sentinel = icon_q.get(timeout=0.25)
+                if sentinel is None:
+                    break  # pystray event loop finished
+                continue
+            except queue.Empty:
+                pass
+
+            if self._icon_update_needed.is_set():
+                self._icon_update_needed.clear()
+                self._do_update_icon()
+
+        t.join(timeout=2)
 
 
 # ── single-instance guard ────────────────────────────────────────────────────
