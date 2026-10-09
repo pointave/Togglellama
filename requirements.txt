@@ -1,2 +1,6 @@
+customtkinter
 pystray
 psutil
+requests
+pillow
+nvidia-ml-py  # provides the pynvml module
